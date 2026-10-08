@@ -175,7 +175,7 @@ async function afterPayment(updatedOrder: any, lowStockMaterials: LowStockMateri
         customerName: updatedOrder.customer?.name ?? "Танихгүй",
         customerPhone: updatedOrder.customer?.phone ?? null,
         totalAmount: Number(updatedOrder.totalAmount),
-        items: updatedOrder.items.map((i) => ({
+        items: updatedOrder.items.map((i: any) => ({
           productName: i.product.name,
           quantity: i.quantity,
           itemType: i.itemType as "SALE" | "RENTAL",
@@ -190,7 +190,7 @@ async function afterPayment(updatedOrder: any, lowStockMaterials: LowStockMateri
       emitToStore(updatedOrder.storeId, "new_online_order", payload);
       emitToStore(updatedOrder.storeId, "inventory_updated", {
         orderId: updatedOrder.id,
-        affectedProductIds: updatedOrder.items.map((i) => i.productId),
+        affectedProductIds: updatedOrder.items.map((i:any) => i.productId),
       });
     }
   } catch (socketErr) {
