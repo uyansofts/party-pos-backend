@@ -1,0 +1,1184 @@
+// ============================================================================
+// DIY PARTY WORKSHOP — Нэгдсэн ПОС Систем (ЗАСВАРЛАСАН ХУВИЛБАР v2)
+// ----------------------------------------------------------------------------
+// Энэ файл нь таны илгээсэн schema дээр илэрсэн 6 асуудлыг засаж, өмнөх
+// ярианд бэлдсэн Payment/GatewayTransaction/StockMovement логиктой нэгтгэсэн
+// БҮРЭН, эцсийн хувилбар юм. Хуучин schema.prisma + schema-addition*.prisma
+// 3 файлыг ЭНЭ ГАНЦ файлаар орлуулж болно.
+//
+// Засварласан зүйлс (тоор дугаарлав, доор кодон дотор ✅ тэмдэгээр дахин
+// зааж өгсөн):
+//   1. Float → Decimal бүх мөнгөн дүнд
+//   2. RentalDetail квант (quantity) асуудал — OrderItem-тэй 1:1 холбож шийдсэн
+//   3. Sale ба Rental нөөцийг ТУСГААРЛАСАН (sellStockQty / rentalStockQty)
+//   4. Гар урлалын хөдөлмөрийн хөлсийг тусад нь загварчилсан (CraftLaborCost)
+//   5. Төлбөрийн Gateway audit (GatewayTransaction) нэмсэн
+//   6. Хэсэгчилсэн төлбөр (PARTIALLY_PAID + paidAmount) дэмжсэн
+// Нэмэлтээр: walk-in харилцагчид login шаардахгүй болгосон, StockMovement
+// түүх нэмсэн, RentalStatus/DepositStatus-д CANCELLED/PENDING нэмсэн.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// 1. АЖИЛТАН (Login-той — зөвхөн ADMIN/CASHIER)
+// ----------------------------------------------------------------------------
+// ✅ ЗАСВАР: Хуучин "User" model нь энгийн үйлчлүүлэгчийг ч login хийлгэдэг
+// байсан тул кассаар ирсэн зочин худалдан авагчийг бүртгэхэд эвгүй байсан.
+// Одоо Staff (нэвтэрдэг) ба Customer (нэвтрэхгүй, зөвхөн утасны дугаараар
+// бүртгэгддэг) гэж 2 тусдаа model болгосон.
+// ============================================================================
+
+enum StaffRole {
+  ADMIN
+  CASHIER
+}
+
+model Staff {
+  id           String    @id @default(uuid())
+  name         String
+  email        String    @unique
+  passwordHash String
+  role         StaffRole @default(CASHIER)
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+
+  orders         Order[]
+  stockMovements StockMovement[]
+}
+
+model Customer {
+  id        String   @id @default(uuid())
+  name      String
+  phone     String   @unique
+  address   String?
+  idCardRef String?  // Түрээсний барьцаанд зориулсан иргэний үнэмлэхийн лавлагаа
+  notes     String?
+  createdAt DateTime @default(now())
+
+  orders Order[]
+}
+
+// ============================================================================
+// 2. БҮТЭЭГДЭХҮҮН
+// ============================================================================
+
+// ============================================================================
+// ✅ ШИНЭ: SHOP SETTINGS — Дэлгүүрийн банкны мэдээлэл (IBAN гэх мэт) зэрэг
+// байнга өөрчлөгддөггүй ерөнхий тохиргоог хадгална. SINGLETON — id үргэлж
+// "default" тул зөвхөн 1 мөр л байх ёстой (findFirst/upsert ашиглана).
+// ============================================================================
+// ============================================================================
+// ✅ ШИНЭ: Хилийн бүсээс ГАДНА байрлалаас "Дэлгүүрийн хүргэлт" хүссэн
+// хүсэлтүүдийг бүртгэнэ — бизнес хэрэв ийм хүсэлт олон гарвал бүсээ
+// өргөтгөх шаардлагатай эсэхээ статистикаар шийдэхэд ашиглана.
+// ============================================================================
+model DeliveryBoundaryRejection {
+  id            String   @id @default(uuid())
+  latitude      Float
+  longitude     Float
+  customerPhone String?
+  createdAt     DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+// ============================================================================
+// ✅ ШИНЭ: "Дэлгүүрийн хүргэлт"-ийн бүсийг тодорхойлох ДУРЫН ТООНЫ цэг —
+// staff бодит тойргийн замыг (гүдгэр/хотгор хэлбэрийг) хэдэн ч цэгээр
+// нарийвчлан тодорхойлж болно. sortOrder-ийг ашиглахгүй, ЭНЭ ХҮСНЭГТЭД
+// хадгалагдсан бүх цэгийг backend ТӨВ ЦЭГЭЭС нь өнцгөөр эрэмблэж (clockwise
+// sort) полигон болгодог тул staff ЯМАР Ч дарааллаар нэмж болно.
+// ============================================================================
+model DeliveryBoundaryPoint {
+  id        String   @id @default(uuid())
+  latitude  Float
+  longitude Float
+  label     String? // Жишээ нь "Хархорин зах" — зөвхөн лавлагаанд, тооцоололд ашиглагдахгүй
+  sortOrder Int      @default(0) // ✅ ШИНЭ — Staff гараар дараалал өөрчилдөг (тойргоор дараалуулах)
+  createdAt DateTime @default(now())
+
+  shopSettingsId String       @default("default")
+  shopSettings   ShopSettings @relation(fields: [shopSettingsId], references: [id])
+}
+
+model ShopSettings {
+  id                String   @id @default("default")
+  bankName          String?
+  bankAccountNumber String?
+  bankIban          String?
+  bankAccountHolder String?
+  shopAddress       String? // ✅ ШИНЭ — хэрэглэгч "очиж авна" сонговол харуулна
+  shopPhone         String? // ✅ ШИНЭ — холбоо барих утас
+
+  // ✅ ШИНЭ: Дэлгүүрийн БАЙРШИЛ (байршил баталгаажуулах лавлагаанд ашиглана)
+  shopLatitude  Float?
+  shopLongitude Float?
+
+  // ✅ ЗАСВАР: Зайнаас (Haversine) АВТОМАТААР тооцдог байсныг больж,
+  // БҮС (А/Б)-аар ХЭРЭГЛЭГЧ/КАССЧИН ГАРААР сонгуулдаг болгосон — учир нь
+  // бодит бүсийн хил (жишээ: Хархорин<->Зүүн 4 зам, Зайсан<->32-ийн тойрог)
+  // тойрог (radius) биш, гудамжны landmark-аар тодорхойлогддог.
+  saleZoneAFee   Decimal @default(10000) @db.Decimal(12, 2) // УБ хот, А бүс — ЗАРАХ бараа
+  saleZoneBFee   Decimal @default(15000) @db.Decimal(12, 2) // УБ хот, Б бүс — ЗАРАХ бараа
+  rentalZoneAFee Decimal @default(50000) @db.Decimal(12, 2) // УБ хот, А бүс — ТҮРЭЭС (хүргээд, буцааж авна)
+  rentalZoneBFee Decimal @default(100000) @db.Decimal(12, 2) // УБ хот, Б бүс — ТҮРЭЭС (хүргээд, буцааж авна)
+
+  // ✅ ШИНЭ: Орон нутгийн унааны төлбөр (ЗӨВХӨН мэдээлэл — худалдан авагч
+  // өөрөө унааны компанид очиж төлдөг тул манай Order.deliveryFee-д ОРОХГҮЙ)
+  localTransportFee Decimal @default(15000) @db.Decimal(12, 2)
+
+  // ✅ ШИНЭ: "Дэлгүүрийн хүргэлт"-ийн бүсийг тодорхойлох 4 хилийн цэг
+  // (Баруун/Зүүн/Хойд/Урд) — эдгээрээс хамгийн бага/их lat/lng-ийг
+  // тооцож, тэгш өнцөгт хилийн хайрцаг (bounding box) үүсгэнэ.
+  // ✅ ЗАСВАР: Тогтмол 4 цэг (Баруун/Зүүн/Хойд/Урд) хангалтгүй байсан —
+  // бодит тойргийн зам гүдгэр/хотгор хэлбэртэй тул одоо ДУРЫН ТООНЫ цэг
+  // (DeliveryBoundaryPoint model) ашиглаж, илүү нарийн полигон үүсгэнэ.
+  boundaryPoints DeliveryBoundaryPoint[]
+
+  // ✅ ШИНЭ: GPS байршил авахад Бүс А/Б-г АВТОМАТААР санал болгоход
+  // ашиглах радиус (дэлгүүрийн координатаас). Хэрэглэгч/кассчин ЗААВАЛ
+  // хүсвэл өөрчилж болно — зөвхөн анхны санал (pre-select) л автомат.
+  zoneAAutoRadiusKm Float @default(5)
+
+  // ✅ ШИНЭ: Хүргэлтийн төлбөрөөс дэлгүүрийн авах хувь (%) — үлдсэн дүнг
+  // хүргэгчид олгоно. Жишээ нь 15 гэвэл, 10,000₮ хүргэлтэд хүргэгч
+  // 8,500₮ авна.
+  courierCommissionPercent Float @default(15)
+  serviceCommissionPercent Float? // ✅ ШИНЭ — Чимэглэлийн ажлын төлбөрөөс дэлгүүрийн авах хувь (хоосон бол хүргэлтийн хувьтай адил)
+  urgentSurchargeAmount     Float  @default(0) // ✅ ШИНЭ — "Хэзээ хэрэгтэй вэ" 24 цагийн дотор бол нэмэгдэх тогтмол дүн
+  errandCancelFeePercent    Float  @default(20) // ✅ ШИНЭ — Курьер авсны дараа илгээгч цуцалбал суутгах хувь (хүргэх курьерт нөхөн олговор)
+  districtZones             Json? // ✅ ШИНЭ — Байршлаа ГАРААР оруулсан харилцагчийн дүүрэг → хүргэлтийн бүс {\"Чингэлтэй\":\"A\",...} (A/B)
+  khorooZones               Json? // ✅ ШИНЭ — Хорооны ХЭМЖЭЭНИЙ бүс {"Баянзүрх":{"1":"A","5":"A"}} — дүүргийн бүсийг хороогоор нарийвчилж давуулна
+  nightHoldEnabled          Boolean @default(true) // ✅ ШИНЭ — Шөнийн цагт дэлгүүрийн хүргэлт гаргахгүй (курьерийн илгээмж үргэлжлэн явна)
+  nightStartHour            Int     @default(22) // Шөнийн цаг эхлэх (УБ-ын цаг, 0-23)
+  nightEndHour              Int     @default(8) // Шөнийн цаг дуусах
+  marketplaceEnabled        Boolean @default(false) // ✅ ШИНЭ — Marketplace (худалдагчийн бараа) нийтэд нээгдсэн эсэх. Захиалгыг худалдагчаар хуваах хэсэг бэлэн болтол УНТРААТАЙ
+  sellerAcceptHours         Int     @default(12) // ✅ ШИНЭ — Төлбөр орсноос хойш худалдагч зөвшөөрөх хугацаа (цаг). Хэтэрвэл захиалга цуцлагдаж, мөнгө буцна
+  sellerReadyAutoOffer      Boolean @default(false) // ✅ ШИНЭ — false: худалдагч "Бэлэн" дарахад Staff мэдэж байж курьерт санал болгоно; true: автоматаар
+  featuredCommissionExtraPercent Float @default(2) // ✅ ШИНЭ — ОНЦЛОХ барааны худалдагчийн комиссд нэмэх % (процентын пункт). 0 = нэмэхгүй
+  saleCommissionExtraPercent     Float @default(2) // ✅ ШИНЭ — ХЯМДРАЛТАЙ барааны худалдагчийн комиссд нэмэх %
+  promoPaymentInfo String? // ✅ ШИНЭ — онцлох байрлалын урьдчилсан төлбөр хаана төлөх (данс, нэр). Худалдагчид порталд харагдана
+  featuredSlotLimit   Int @default(8)  // ✅ ШИНЭ — нэгэн зэрэг онцлох барааны ДЭЭД тоо (Staff-ийн хугацаагүй онцолсон бараа ч тоологдоно)
+  featuredHoldMinutes Int @default(20) // ✅ ШИНЭ — Staff зөвшөөрсний дараа төлөх хугацаа (минут). Хэтэрвэл байрлал чөлөөлөгдөнө
+  sellerPayoutHoldDays      Int     @default(3) // ✅ ШИНЭ — Хүргэснээс хойш худалдагчид мөнгө олгохоос өмнөх хүлээлтийн хугацаа (өдөр): буцаалт/маргааны хамгаалалт
+  materialMarkupPercent    Float @default(100) // ✅ ШИНЭ — Материалын өртөгт нэмэх хувь (борлуулах үнэ = өртөг × (1 + хувь/100))
+
+  updatedAt DateTime @updatedAt
+}
+
+// ✅ ШИНЭ: Захиалгаа өөрөө очиж авах уу, хүргүүлэх үү
+enum DeliveryMethod {
+  PICKUP // Өөрөө очиж авна
+  DELIVERY // ✅ ЗАСВАР: "Өөрсдийн унаа" — УБ хотын дотор, А/Б БҮСЭЭР тооцсон үнэ (SALE/RENTAL тус тусын хүснэгттэй)
+  POST // Хөдөө орон нутаг ЭСВЭЛ УБ хотоос гадна — Монгол Шуудангаар (Шуудан хүртэл манайх ҮНЭГҮЙ хүргэнэ, цаашдын зардал тусад нь)
+  LOCAL_TRANSPORT // Хөдөө орон нутагт унаагаар (Унааны буудал хүртэл манайх ТӨЛБӨРТЭЙ хүргэнэ, тэндээс цаашдыг харилцагч нэмж төлнө)
+  UB_CAB // ✅ ШИНЭ — УБ хотод: харилцагч өөрөө UB Cab дуудаж манай хаягаас очиж авна (манай дүнд ОРОХГҮЙ)
+}
+
+// ============================================================================
+// ✅ ШИНЭ: Хүргэлтийн ажилтны бүртгэл + хуваарилалтын төлөв
+// ----------------------------------------------------------------------------
+// Хуваарилалт HYBRID — аль аль нь боломжтой:
+//   1) Broadcast → хэн түрүүлж Accept дарна, тэр авна (race condition-оос
+//      хамгаалахтай — эхлээд шалгаад атомик update хийнэ)
+//   2) Staff POS-оос тодорхой хүргэгчид ШУУД гараар оноож болно
+// ============================================================================
+enum DeliveryAssignStatus {
+  UNASSIGNED // Хараахан хүргэгчдэд санал болгоогүй
+  OFFERED // Бүх идэвхтэй хүргэгчид broadcast хийгдсэн, Accept хүлээж байна
+  ASSIGNED // Аль нэг хүргэгч Accept дарсан (эсвэл Staff гараар оноосон) — ХАРАМСАЛТАЙ НЬ ХАРААХАН ДЭЛГҮҮРТ ИРЭЭГҮЙ
+  PICKED_UP // Курьер дэлгүүрээс БОДИТООР ирж, барааг авсан (Staff биечлэн баталгаажуулна)
+  GIVEN // ЗӨВХӨН ТҮРЭЭСТ: барааг харилцагчид өгсөн, буцаалт хүлээгдэж байна
+  RETURN_PICKED_UP // ✅ ШИНЭ — ЗӨВХӨН ТҮРЭЭСТ: курьер харилцагчаас буцаан авсан ч ЗАМД байгаа (дэлгүүрт хараахан ирээгүй)
+  DELIVERED // Хүргэж/буцаалт бүрэн дууссан — ТҮРЭЭСТ: курьер дэлгүүрт БОДИТООР авчирч, Staff барьцаа/гэмтэл шалгаж баталгаажуулсан
+  CANCELLED // ✅ ШИНЭ — ЗӨВХӨН курьерийн илгээмж: илгээгч цуцалсан (авсны өмнө)
+}
+
+// ✅ ШИНЭ: Курьерт харуулах ачааны ойролцоо хэмжээ (барааны нэрийн оронд)
+enum PackageSize {
+  SMALL // Жижиг — гар цүнхэнд багтана
+  MEDIUM // Дунд — арын сандал/цүнхэнд
+  LARGE // Том — их бие/чиргүүл шаардлагатай байж болно
+}
+
+// ============================================================================
+// ✅ ШИНЭ: Хүргэгч бүрийн "Боломжит хүргэлт"-д өгсөн хариу (Алгассан/Авсан)
+// бүртгэнэ — POS дээр "хэн алгассан, хэн авсан" гэдгийг харуулах, мөн
+// АЛГАССАН хүргэгчид ижил захиалгыг ДАХИН санал болгохгүй байхад ашиглана.
+// ----------------------------------------------------------------------------
+// ⚠️ "Авсан" (ACCEPTED) тохиолдол энд ХОЁР ДАХИН бичигдэхгүй — энэ нь
+// Order.courierId/deliveryAcceptedAt дээр АЛЬ ХЭДИЙН бүртгэгддэг. Энэ
+// хүснэгт зөвхөн IGNORED-ийг бүртгэнэ (мөн лавлагаанд ACCEPTED-ийг ч
+// хадгалж болно — доор тайлбарлав).
+// ============================================================================
+model DeliveryOfferResponse {
+  id          String                     @id @default(uuid())
+  orderId     String
+  order       Order                      @relation(fields: [orderId], references: [id]) // ✅ ЗАСВАР — дутуу байсан
+  courierId   String
+  courier     Courier                    @relation(fields: [courierId], references: [id])
+  response    DeliveryOfferResponseType
+  respondedAt DateTime                   @default(now())
+
+  @@unique([orderId, courierId]) // Нэг хүргэгч НЭГ захиалгад ЗӨВХӨН НЭГ удаа хариу өгнө
+}
+
+enum DeliveryOfferResponseType {
+  IGNORED
+  ACCEPTED
+  RELEASED // ✅ ШИНЭ — Accept хийсэн курьер бараа авахаас өмнө \"хүргэж чадахгүй\" гэж чөлөөлөгдсөн
+  REJECTED_BY_REQUESTER // ✅ ШИНЭ — Илгээгч (илгээмж илгээсэн курьер) энэ курьерийг солисон
+}
+
+model Courier {
+  id        String   @id @default(uuid())
+  name      String
+  phone     String   @unique
+  pinHash   String // 4 оронтой PIN-ийг bcrypt-ээр хэшилнэ
+  isActive  Boolean  @default(true) // Идэвхгүй болговол шинэ санал авахгүй
+  isAdmin   Boolean  @default(false) // ✅ ШИНЭ — Курьер апп дээр "Бүх хүргэлт" (бусад курьерийн ажлыг ч харах) горим нээгдэнэ
+  createdAt DateTime @default(now())
+
+  // ✅ ШИНЭ: Аюулгүй байдал — иргэний үнэмлэхний дугаар + Staff-ийн нүдэн
+  // баталгаажуулалт (e-Mongolia албан ёсны зөвшөөрөл авах хүртэл ЭНЭ бол
+  // хамгийн практик түр шийдэл).
+  idCardNumber       String? // Иргэний үнэмлэхний дугаар (Staff бүртгэхдээ бичнэ)
+  registerNumber     String? @unique // ✅ ШИНЭ — Регистрийн дугаар (УБ12345678). Нэг хүн хоёр акаунт нээхээс сэргийлж давтагдахгүй
+
+  // ✅ ШИНЭ: Курьерийн нэмэлт бүртгэл (аюулгүй байдал/санхүүгийн лавлагаа)
+  lastName              String? // Овог
+  verifiedHomeAddress   String? // Баталгаажсан гэрийн хаяг
+  photoUrl              String? // Фото зураг (Google Drive линк)
+  bankName              String? // Банкны нэр
+  bankAccountNumber     String? // Дансны дугаар
+  bankIban              String? // IBAN дугаар
+  emergencyContactPhone String? // Нэмэлт холбоо барих хүний утас
+  verificationStatus CourierVerificationStatus @default(PENDING)
+
+  // ✅ ШИНЭ: НИЙТЭД харагдах танилт — бүртгэлтэй (жинхэнэ) нэр нууц, nickname илгээгч/хүлээн авагчид харагдана.
+  nickname     String? // Нийтэд харагдах нэр (2-24 тэмдэгт)
+  vehiclePlate String? // Машины дугаар (жишээ: 1234УБА) — хүлээн авагч хүргэгчийг таних
+  ratings      DeliveryRating[] @relation("CourierRatings")
+  payouts      CourierPayout[] // ✅ ШИНЭ — Орой нэг мөсөн төлсөн тооцоонууд
+
+  // ✅ ШИНЭ: Ажилтны барьцаа — RentalDetail-тэй ИЖИЛ DepositType ашиглана
+  depositType       DepositType?
+  depositAmount     Decimal          @default(0) @db.Decimal(12, 2)
+  depositStatus     CourierDepositStatus @default(NONE)
+  depositHeldAt     DateTime?
+  depositReturnedAt DateTime?
+  depositNote       String? // "Иргэний үнэмлэх хадгалж байна" гэх мэт тэмдэглэл
+
+  // ✅ ШИНЭ: Хамгийн сүүлийн байршил — ЗӨВХӨН идэвхтэй хүргэлттэй үед л
+  // курьер апп-аас илгээгдэнэ (ажилтны нууцлалыг хүндэтгэж байнга ХӨТЛӨХГҮЙ).
+  currentLatitude          Float?
+  currentLongitude         Float?
+  currentLocationUpdatedAt DateTime?
+
+  deviceTokens    CourierDeviceToken[]
+  offerResponses  DeliveryOfferResponse[] // ✅ ШИНЭ
+  deliveries   Order[]
+  requestingErrands Order[] @relation("RequestingCourierErrands") // ✅ ШИНЭ — Энэ курьерийн ӨӨРИЙН илгээсэн барааны хүсэлтүүд
+}
+
+enum CourierVerificationStatus {
+  PENDING // Бүртгэгдсэн ч Staff нүдэн баталгаажуулаагүй
+  VERIFIED // Иргэний үнэмлэхийг нь Staff шалгаж баталгаажуулсан
+  REJECTED // Баталгаажуулалтад тэнцээгүй (ажиллуулахгүй)
+}
+
+enum CourierDepositStatus {
+  NONE // Барьцаа аваагүй
+  HELD // Барьцаа авсан (мөнгө эсвэл бичиг баримт)
+  RETURNED // Ажлаас гарахад барьцааг буцаасан
+}
+
+/// Нэг хүргэгч хэд хэдэн төхөөрөмж (утас) дээр нэвтэрсэн байж болно —
+/// FCM push бүгдэд нь илгээхийн тулд тус бүрийг тусад нь хадгална.
+model CourierDeviceToken {
+  id        String   @id @default(uuid())
+  courierId String
+  courier   Courier  @relation(fields: [courierId], references: [id])
+  fcmToken  String   @unique
+  platform  String? // "android" | "ios"
+  createdAt DateTime @default(now())
+}
+
+model Category {
+  id       String     @id @default(uuid())
+  name     String
+  parentId String?
+  parent   Category?  @relation("CategoryTree", fields: [parentId], references: [id])
+  children Category[] @relation("CategoryTree")
+
+  // Excel-ийн "id" баганыг хадгалж, дахин import хийхэд ЯГ ТЭР мөрийг
+  // танихад (upsert) ашиглана — үгүй бол дахин ажиллуулах бүрт давхардал үүснэ.
+  legacyId Int? @unique
+
+  // ✅ ШИНЭ (Etsy шиг storefront): Ангиллын дугуй зураг. Хоосон бол storefront ангиллын эхний барааны зургийг fallback болгоно.
+  imageUrl String?
+
+  products Product[]
+
+  @@index([parentId])
+}
+
+model Product {
+  id          String   @id @default(uuid())
+  name        String
+  sku         String   @unique
+  description String?
+
+  // ---------- ✅ ШИНЭ: Өнгө, Хэмжээ тусдаа хайлт хийх боломжтой болгох ----------
+  // Өмнө нь description-д нэгтгэж бичдэг байсан ("Өнгө: X | Хэмжээ: Y") —
+  // одоо тусдаа багана болгон, хайлт/шүүлтүүрт шууд ашиглах боломжтой.
+  color String?
+  size  String?
+
+  // ---------- ✅ ШИНЭ: Зураг + Ангилал (мод бүтэцтэй Category-руу холбоно) ----------
+  imageUrl   String?
+  // ✅ ШИНЭ (Etsy шиг): Барааны ОЛОН зураг (дараалалтай, хамгийн ихдээ 10). imageUrl = ТҮЛХҮҮР (cover) = imageUrls[0] — хуучин код (POS, сагс) хэвээр ажиллана.
+  imageUrls  String[] @default([])
+  // ✅ ШИНЭ: Харилцагчид харагдах тайлбар. (description нь ДОТООД — Байршил, Баркод зэрэг тул нийтэд ХАРАГДАХГҮЙ)
+  publicDescription String?
+  // ✅ ШИНЭ (Etsy шиг): Нүүр хуудасны "Онцлох бараа" — Staff сонгоно. featuredOrder бага нь эхэнд.
+  isFeatured    Boolean @default(false)
+  featuredOrder Int?
+  featuredUntil DateTime? // ✅ ШИНЭ — төлбөртэй онцлох байрлалын ДУУСАХ хугацаа. null + isFeatured = Staff хугацаагүй онцолсон
+  promotions    FeaturedPromotion[]
+  // ✅ ШИНЭ: Хямдрал. salePrice < sellPrice (ба saleEndsAt өнгөрөөгүй) үед харилцагч salePrice-ээр төлнө. Хямдралтай барааны дэлгүүрийн шимтгэл нэмэгдэнэ.
+  salePrice  Decimal? @db.Decimal(12, 2)
+  saleEndsAt DateTime?
+  salePercent    Int?      // ✅ ШИНЭ — хямдралын ХУВЬ (эх сурвалж; salePrice үүнээс тооцогдоно)
+  saleStartsAt   DateTime?
+  priceChangedAt DateTime? // Үндсэн үнэ хамгийн сүүлд өөрчлөгдсөн цаг (хуурамч хямдралаас хамгаална)
+  reviews       ProductReview[]
+  categoryId String?
+  category   Category? @relation(fields: [categoryId], references: [id])
+  // ✅ ШИНЭ (Etsy шиг marketplace): Бараа аль худалдагчийнх вэ. null = манай өөрийн бараа.
+  sellerId   String?
+  seller     Seller?   @relation(fields: [sellerId], references: [id])
+
+  // ---------- ✅ ЗАСВАР #1: Float → Decimal ----------
+  // Мөнгөн дүнд Float ашиглавал 0.1+0.2=0.30000000000000004 мэт
+  // дугуйруулалтын алдаа гардаг. Decimal(12,2) нь яг 2 орны нарийвчлалтай.
+  sellPrice         Decimal? @db.Decimal(12, 2) // Борлуулах үнэ (RETAIL/HANDICRAFT)
+  costPrice         Decimal  @default(0) @db.Decimal(12, 2) // Recipe+Labor-с автоматаар нийлбэрлэнэ
+  rentalPricePerDay Decimal? @db.Decimal(12, 2)
+  depositAmount     Decimal? @db.Decimal(12, 2) // Стандарт барьцааны хэмжээ
+
+  isRental Boolean @default(false)
+  isCraft  Boolean @default(false)
+
+  // ============================================================================
+  // ✅ ШИНЭ: ТУСГАЙ ЗАХИАЛГА (Etsy-ийн "Variations + Personalization" загвар)
+  // ----------------------------------------------------------------------------
+  // Жишээ: Cake topper (материал: Хуулга/Plywood, өнгө, хэмжээ) эсвэл
+  // түрээслэдэг арк дээр бичүүлэх нэр гэх мэт.
+  // ============================================================================
+  isCustomizable              Boolean @default(false) // Энэ бараанд сонголт/бичвэр авах уу?
+  personalizationEnabled      Boolean @default(false) // Чөлөөт текст (жишээ нь нэр) авах уу?
+  personalizationLabel        String? // Жишээ нь: "Бичих нэр", "Бичих текст"
+  personalizationMaxLength    Int?    @default(50)
+  personalizationRequired     Boolean @default(false)
+  usesMaterialPricing         Boolean @default(false) // ✅ ШИНЭ — Материал + хэмжээгээр (талбайгаар) үнэлэх тусгай захиалга уу?
+  // ✅ ШИНЭ: Энэ бараанд зөвшөөрөгдсөн материалууд (хоосон бол БҮХ идэвхтэй материал зөвшөөрнө — хуучин зан төлөвтэй нийцнэ)
+  allowedMaterials            Material[] @relation("ProductAllowedMaterials")
+  customFields                Json? // ✅ ШИНЭ — Хувийн мэдээллийн талбарууд: [{key,label,type,unit,required,maxLength}] (нэр, төрсөн цаг, өндөр, жин г.м.)
+  // ✅ ШИНЭ: Нэмэлт үйлчилгээ (жишээ: "Бөмбөлгөн чимэглэлийг биднээр хийлгэх") — НЭГ удаагийн төлбөр
+  serviceEnabled              Boolean  @default(false)
+  serviceLabel                String?
+  serviceFee                  Decimal? @db.Decimal(12, 2)
+  serviceRequiresCourierDelivery Boolean @default(true) // ✅ ШИНЭ — Унтраасан бол харилцагч ЯМАР Ч аргаар (өөрөө ирж авах, UB Cab гэх мэт) авч болно
+  variationGroups             ProductVariationGroup[] // Материал/Өнгө/Хэмжээ гэх мэт
+
+  // ---------- ✅ ЗАСВАР #3: Sale ба Rental нөөцийг тусгаарласан ----------
+  // Хуучин схемд ганц "stock" талбар SALE-д ч, RENTAL-д ч ашиглагддаг байсан
+  // тул нэг бараа хоёр процессоор зэрэг "зарагдаж" болзошгүй байсан.
+  // Одоо 2 тусдаа сан:
+  sellStockQty   Int  @default(0) // Шууд зарагдах нөөц (ширхэг)
+  rentalStockQty Int? // Түрээслэгддэг биет ширхэгийн НИЙТ тоо
+
+  minStockAlert Int     @default(3)
+  isActive      Boolean @default(true)
+  staffLocked   Boolean @default(false) // ✅ ШИНЭ — Staff идэвхгүй болгосон бол худалдагч порталаас дахин ИДЭВХЖҮҮЛЖ чадахгүй
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // ---------- ✅ ЗАСВАР #4: Гар урлалын өртөг — материал + хөдөлмөр ----------
+  materialsUsed  CraftRecipe[]     @relation("ProductMaterials") // Энэ бүтээгдэхүүнд орсон түүхий эд
+  usedAsMaterial CraftRecipe[]     @relation("MaterialSource")   // Энэ бараа өөр бараанд түүхий эд болж орсон эсэх
+  laborCosts     CraftLaborCost[]
+
+  orderItems     OrderItem[]
+  stockMovements StockMovement[]
+
+  @@index([isRental])
+  @@index([isCraft])
+  @@index([categoryId])
+  @@index([sellerId])
+}
+
+// ============================================================================
+// 3. ГАР УРЛАЛЫН ӨРТӨГ — Материал (BOM) + Хөдөлмөр
+// ----------------------------------------------------------------------------
+// ✅ ЗАСВАР #4: Хуучин CraftRecipe зөвхөн материалыг загварчилж, хөдөлмөрийн
+// хөлсийг хуурамч "Product" үүсгэж оруулах шаардлагатай байв. Одоо
+// CraftLaborCost гэсэн тусдаа model-оор цаг + цагийн хөлсийг шууд бичнэ.
+// ============================================================================
+
+model CraftRecipe {
+  id         String  @id @default(uuid())
+  productId  String  // Бэлэн гар урлалын бүтээгдэхүүн
+  product    Product @relation("ProductMaterials", fields: [productId], references: [id])
+  materialId String  // Зарцуулагдсан түүхий эд (мөн Product хүснэгтэд байна)
+  material   Product @relation("MaterialSource", fields: [materialId], references: [id])
+
+  quantity          Decimal @db.Decimal(10, 2) // жишээ: 2.5 метр
+  unitCostSnapshot  Decimal @db.Decimal(12, 2) // Орц бичсэн мөчийн нэгжийн үнэ
+  // ^ "Snapshot" гэдэг нь чухал: хожим материалын үнэ өөрчлөгдөхөд өмнөх
+  // тооцоолсон costPrice-ууд буруу өөрчлөгдөхөөс сэргийлнэ.
+
+  @@index([productId])
+}
+
+enum LaborCostBasis {
+  HOURLY // hours * hourlyRate
+  FIXED  // тогтмол дүн (жишээ: нэг ажлын хөлс)
+}
+
+model CraftLaborCost {
+  id          String         @id @default(uuid())
+  productId   String
+  product     Product        @relation(fields: [productId], references: [id])
+  description String         // "Оёдол", "Будаж чимэглэх" гэх мэт
+  basis       LaborCostBasis @default(HOURLY)
+  hours       Decimal?       @db.Decimal(6, 2)
+  hourlyRate  Decimal?       @db.Decimal(12, 2)
+  fixedAmount Decimal?       @db.Decimal(12, 2)
+  totalCost   Decimal        @db.Decimal(12, 2) // = hours*hourlyRate ЭСВЭЛ fixedAmount
+
+  @@index([productId])
+}
+
+// Product.costPrice = SUM(CraftRecipe.quantity * unitCostSnapshot)
+//                    + SUM(CraftLaborCost.totalCost)
+// Энэ нийлбэрийг DB trigger ЭСВЭЛ app-level service-ээр CraftRecipe/
+// CraftLaborCost бичигдэх бүрд дахин тооцож Product.costPrice-руу бичнэ.
+
+// ============================================================================
+// 4. НӨӨЦИЙН ХӨДӨЛГӨӨН (шинээр нэмэгдсэн)
+// ----------------------------------------------------------------------------
+// Хуучин схемд байхгүй байсан тул нөөц зөрөхөд яагаад/хэзээ өөрчлөгдснийг
+// мөрдөх боломжгүй байв.
+// ============================================================================
+
+enum StockMovementType {
+  PURCHASE_IN
+  SALE_OUT
+  RENTAL_OUT
+  RENTAL_RETURN
+  DAMAGE_LOSS
+  ADJUSTMENT
+  CRAFT_CONSUME // Гар урлал хийхэд түүхий эд зарцуулагдах үед
+}
+
+model StockMovement {
+  id               String            @id @default(uuid())
+  productId        String
+  product          Product           @relation(fields: [productId], references: [id])
+  staffId          String?
+  staff            Staff?            @relation(fields: [staffId], references: [id])
+  type             StockMovementType
+  quantity         Int
+  referenceOrderId String?
+  note             String?
+  createdAt        DateTime          @default(now())
+
+  @@index([productId])
+  @@index([type])
+}
+
+// ============================================================================
+// 5. ЗАХИАЛГА (ПОС + ОНЛАЙН нэгдсэн)
+// ----------------------------------------------------------------------------
+// ✅ ЗАСВАР #6: PayStatus-д PARTIALLY_PAID нэмж, paidAmount талбар нэмсэн —
+// хагас төлбөртэй захиалгыг (жишээ: барьцаа бэлнээр, үлдэгдэл QPay-ээр)
+// зөв хөтлөх боломжтой боллоо.
+// ============================================================================
+
+enum OrderType {
+  POS
+  ONLINE
+  COURIER_ERRAND // ✅ ШИНЭ — Курьерийн ӨӨРИЙН барааг өөр курьерээр хүргүүлэх хүсэлт
+}
+
+enum PayStatus {
+  PENDING
+  PARTIALLY_PAID
+  PAID
+  REFUNDED
+  CANCELLED
+}
+
+model Order {
+  id          String    @id @default(uuid())
+  orderNumber String    @unique
+
+  customerId String?
+  customer   Customer? @relation(fields: [customerId], references: [id])
+  staffId    String? // Онлайн захиалгад staff байхгүй байж болно
+  staff      Staff?    @relation(fields: [staffId], references: [id])
+
+  orderType     OrderType @default(POS)
+  storeId       String    @default("default") // олон салбартай бол ашиглана
+
+  totalAmount   Decimal   @db.Decimal(12, 2)
+  paidAmount    Decimal   @default(0) @db.Decimal(12, 2)
+  paymentStatus PayStatus @default(PENDING)
+
+  // ✅ ШИНЭ: "Шинэ PAID захиалгуудыг нэг дор хэвлэх" функцэд ашиглана —
+  // хэвлэгдсэн захиалгыг дахин хэвлэлтэнд оруулахгүй байхад хэрэглэнэ.
+  isPrinted Boolean @default(false)
+
+  // ✅ ШИНЭ: Хүргэлтийн мэдээлэл — customer/POS checkout дээр сонгоно
+  deliveryMethod  DeliveryMethod @default(PICKUP)
+  deliveryAddress String?
+  deliveryFee     Decimal        @default(0) @db.Decimal(12, 2)
+  serviceAmount           Decimal  @default(0) @db.Decimal(12, 2) // ✅ ШИНЭ — Чимэглэл г.м. нэмэлт үйлчилгээний нийт төлбөр (курьер хийнэ)
+  serviceLabel            String? // ✅ ШИНЭ — Курьерт харагдах ажлын нэр (жишээ: Бөмбөлгөн чимэглэлийг биднээр хийлгэх)
+  neededByDate            DateTime? // ✅ ШИНЭ — Харилцагчид хэзээ хэрэгтэй вэ (SALE: заавал асуусан; RENTAL: эхлэх огнооноос автоматаар)
+  isUrgent                Boolean  @default(false) // ✅ ШИНЭ — neededByDate 24 цагийн дотор байсан эсэх (үүсэх үед тооцогдоно)
+  urgentThresholdHours    Int      @default(24) // ✅ ШИНЭ — Яаралтайн босго (цаг): энгийн худалдах бараа 24, түрээс/тусгай захиалга 48 (үүсэх үед тогтоогдоно)
+  urgentFee               Decimal  @default(0) @db.Decimal(12, 2) // ✅ ШИНЭ — Яаралтай нэмэгдэл (snapshot)
+  deliveryLatitude  Float? // ✅ ШИНЭ — "Байршил илгээх" товчоор ирсэн координат
+  deliveryLongitude Float?
+
+  // ✅ ШИНЭ: Хүргэлтийн ажилтны хуваарилалт (зөвхөн DELIVERY/UB_CAB зэрэг
+  // манайх өөрөө хүргэдэг захиалгад хамаарна — POST/UB_CAB-д хэрэггүй)
+  courierId               String?
+  courier                 Courier?                @relation(fields: [courierId], references: [id])
+  // ✅ ШИНЭ: COURIER_ERRAND төрлийн захиалгад — БАРАА ИЛГЭЭЖ буй курьер
+  // (courierId-ээс ЯЛГААТАЙ — тэр нь ХҮРГЭЖ буй курьер).
+  requestingCourierId     String?
+  requestingCourier       Courier?                @relation("RequestingCourierErrands", fields: [requestingCourierId], references: [id])
+  deliveryAssignStatus    DeliveryAssignStatus    @default(UNASSIGNED)
+  // ✅ ШИНЭ: Курьерт БАРААНЫ НЭР биш, харин ОВОР ХЭМЖЭЭГ л харуулна
+  // (аюулгүй байдал/нууцлалын үүднээс). Staff POS дээр гараар тохируулна.
+  packageSize             PackageSize  @default(SMALL) // ✅ ЗАСВАР — Staff сонгоогүй бол "Жижиг" гэж тооцно
+  // ✅ ШИНЭ: БИД хүргэгчид түүний хүргэлтийн төлбөрийг (deliveryFee)
+  // ТӨЛСӨН эсэх — захиалгын (харилцагчийн) төлбөртэй ХОЛБООГҮЙ, зөвхөн
+  // хүргэгчийн шимтгэлийн тооцоог хянахад ашиглана.
+  courierFeePaid          Boolean               @default(false)
+  courierFeePaidAt        DateTime?
+  courierPayoutId         String? // ✅ ШИНЭ — Аль багц (нэг мөсөн) төлөлтөд орсон
+  courierPayout           CourierPayout? @relation(fields: [courierPayoutId], references: [id])
+  courierPayoutAmount     Decimal? @db.Decimal(12, 2) // Төлөх үеийн курьерт очсон ЦЭВЭР дүн (snapshot — хувь хожим өөрчлөгдсөн ч хэвээр)
+  deliveryOfferedAt       DateTime? // Хүргэгчдэд санал болгосон (broadcast хийсэн) цаг
+  deliveryAcceptedAt      DateTime? // Хүргэгч Accept дарсан цаг
+  pickedUpAt              DateTime? // ✅ ШИНЭ — Курьер дэлгүүрээс биечлэн ирж авсан цаг (Staff баталгаажуулна)
+  rentalGivenAt           DateTime? // ✅ ШИНЭ — ЗӨВХӨН ТҮРЭЭСТ: барааг өгсөн цаг (OTP-ээр баталгаажсан)
+  returnPickedUpAt        DateTime? // ✅ ШИНЭ — Курьер харилцагчаас буцаан авсан цаг (дэлгүүрт хараахан ирээгүй)
+  deliveredAt             DateTime? // Хүргэж дуусгасан цаг (ТҮРЭЭСТ: буцаан авсан цаг)
+  offerResponses          DeliveryOfferResponse[] // ✅ ЗАСВАР — дутуу байсан (хэн алгассан/авсан)
+
+  // ✅ ШИНЭ: Хүргэлтийн хяналт (delivery-watcher.service.ts) — давхар сануулга явуулахгүйн тулд
+  deliveryAlertLevel      Int                     @default(0) // 0: сануулга байхгүй, 1: "Курьер дэлгүүрт ирээгүй" явсан, 2: "Хүргэлт удаж байна" явсан
+  returnReminderSent      Boolean                 @default(false) // Түрээс буцаах өдрийн сануулга курьерт явсан эсэх
+  proofs                  DeliveryProof[] // ✅ ШИНЭ — Хүргэсэн/буцаан авсан баталгаажуулах зураг
+
+  // ✅ ШИНЭ: Хүргэлт баталгаажуулах OTP кодууд (4 оронтой) — Захиалга
+  // үүсэх үед автоматаар үүсгэгдэж, харилцагчид ШУУД харуулагдана.
+  // Хүргэгч харилцагчаас код асууж баталгаажуулна — зөвхөн товч дарж
+  // "хүргэсэн" гэж хуурамчаар мэдэгдэхээс сэргийлнэ.
+  deliveryOtp             String? // Анхны хүргэлт/өгөх баталгаажуулах код (COURIER_ERRAND-д ХҮЛЭЭН АВАГЧ өгнө)
+  returnOtp                String? // ЗӨВХӨН ТҮРЭЭСТ: буцаан авах баталгаажуулах код
+  // ✅ ШИНЭ: COURIER_ERRAND — Хүргэх курьер БАРАА АВАХДАА (Requesting courier-ээс)
+  // асуух баталгаажуулах код. Энгийн захиалганд (Staff гараар товч дарна) хэрэггүй.
+  pickupOtp               String?
+  errandDescription       String? // "1 хайрцаг баримт бичиг" гэх мэт чөлөөт бичвэр
+  pickupAddress           String? // Гараар бичсэн авах хаяг (COURIER_ERRAND — ердийн захиалганд үргэлж дэлгүүр)
+  pickupLatitude          Float?
+  pickupLongitude         Float?
+  // ✅ ШИНЭ: Курьерийн илгээмжийн цуцлалт/буцаалт
+  cancelledAt             DateTime?
+  cancelReason            String?
+  cancellationFee         Decimal  @default(0) @db.Decimal(12, 2) // Авсны дараа цуцалсан үед хүргэх курьерт олгох нөхөн олговор (deliveryFee-д ч энэ дүн орно)
+  refundDueAmount         Decimal  @default(0) @db.Decimal(12, 2) // Staff-ийн буцаах ёстой үлдэгдэл (0 бол буцаах зүйлгүй)
+  refundedAt              DateTime?
+  // ✅ ШИНЭ: Курьерийн илгээмж — барааг АВСАН мөчийн хүргэх курьерийн байршил (баталгаа) + байршил тасарсны сануулгын цаг
+  pickupConfirmLatitude   Float?
+  pickupConfirmLongitude  Float?
+  locationAlertSentAt     DateTime?
+  // ✅ ШИНЭ: Курьерийн илгээмж — барааг хүлээн авагч (хүргэх курьер энэ дугаараар холбогдоно)
+  recipientName           String?
+  recipientPhone          String? // 8 оронтой, нормчилсон (+976, зай, зураас хассан)
+  rating                  DeliveryRating? // ✅ ШИНЭ — Илгээгчийн хүргэсэн курьерт өгсөн од (1 захиалгад нэг)
+  // ✅ ШИНЭ (Etsy шиг marketplace, Хэсэг 2): Худалдагчийн захиалга. Сагсыг худалдагчаар ХУВААСАН бодит захиалга —
+  // курьер, код, хяналтын одоогийн бүх механизм ийм захиалгад шууд ажиллана.
+  sellerId                String?
+  seller                  Seller?  @relation(fields: [sellerId], references: [id])
+  orderGroupId            String? // Нэг сагсны (НЭГ ТӨЛБӨРИЙН) захиалгуудын бүлэг. Бүлгийн ҮНДСЭН захиалгын id (үндсэн нь өөрийгөө заана)
+  sellerStatus            SellerOrderStatus?
+  sellerAcceptDeadline    DateTime? // Төлбөр орсноос хойш худалдагч зөвшөөрөх эцсийн хугацаа
+  sellerRespondedAt       DateTime?
+  sellerReadyAt           DateTime? // ✅ ШИНЭ — худалдагч "Бэлэн" болгосон цаг (Staff курьерт санал болгох хүртэл хүлээсэн хугацааг хянахад)
+  sellerRejectReason      String?
+  commissionPercent       Float? // Snapshot — худалдагчийн комиссын хувь тэр үед
+  commissionAmount        Decimal? @db.Decimal(12, 2) // Платформын орлого (бараа × хувь). Худалдагчид очих = бараа − комисс
+  sellerPayoutId          String? // ✅ ШИНЭ — Аль багц төлөлтөөр худалдагчид мөнгийг нь олгосон
+  sellerPayout            SellerPayout? @relation(fields: [sellerPayoutId], references: [id])
+  sellerPayoutAmount      Decimal? @db.Decimal(12, 2) // Олгосон ЦЭВЭР дүн (snapshot — комисс хожим өөрчлөгдсөн ч хэвээр)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items               OrderItem[]
+  payments            Payment[]
+  gatewayTransactions GatewayTransaction[]
+
+  @@index([paymentStatus])
+  @@index([customerId])
+  @@index([orderGroupId])
+  @@index([sellerId, sellerStatus])
+}
+
+// ============================================================================
+// 6. ЗАХИАЛГЫН МӨР (Sale эсвэл Rental)
+// ----------------------------------------------------------------------------
+// ✅ ЗАСВАР #2: Хуучин RentalDetail нь Order+Product-той шууд холбогдож,
+// quantity талбаргүй байсан тул "ижил барааг 2 ширхэг түрээслэвэл яах вэ?"
+// гэдэг асуулт шийдэгдээгүй байв. Одоо OrderItem дээр quantity нэг л газар
+// байж, RentalDetail нь ЯГ ТУХАЙН OrderItem-тэй 1:1 холбогдоно (доор харна
+// уу) — давхардал арилж, quantity нэг эх сурвалжтай боллоо.
+// ============================================================================
+
+enum OrderItemType {
+  SALE
+  RENTAL
+}
+
+model OrderItem {
+  id        String        @id @default(uuid())
+  orderId   String
+  order     Order         @relation(fields: [orderId], references: [id])
+  productId String
+  product   Product       @relation(fields: [productId], references: [id])
+
+  itemType  OrderItemType
+  quantity  Int
+  unitPrice Decimal       @db.Decimal(12, 2) // SALE бол sellPrice, RENTAL бол dailyRate огноо тутмын үнэ
+  subtotal  Decimal       @db.Decimal(12, 2)
+
+  // ✅ ШИНЭ: Бараа олгогдсон эсэх (Захиалгын түүхэнд харуулна). POS
+  // захиалгад төлбөр орсон дор дор олгодог тул автоматаар true болно;
+  // ONLINE захиалгад хэрэглэгч ирж авах хүртэл false үлдэнэ.
+  isIssued Boolean   @default(false)
+  issuedAt DateTime?
+
+  rentalDetail RentalDetail? // itemType == RENTAL үед л энэ мөр үүснэ
+
+  // ✅ ШИНЭ: Тусгай захиалгын мэдээлэл — сонгосон Variation утгууд (Material/
+  // Color/Size) БОЛОН чөлөөт бичвэр (жишээ нь нэр). JSON хэлбэрээр хадгална
+  // (жишээ нь {"Материал":"Хуулга","Өнгө":"Алтан"}) — учир нь бараа бүр
+  // ӨӨР ӨӨР Variation бүлэгтэй байж болно (хатуу баганаар зохион байгуулбал
+  // уян хатан бус).
+  customizationText  String?
+  customizationDeadline DateTime? // ✅ ШИНЭ — Тусгай захиалга "хэзээ хэрэгтэй" (Etsy-ийн deadline)
+  deadlineAlertSent     Boolean   @default(false) // ✅ ШИНЭ — 24ц дотор сануулга явуулсан эсэх (давхар илгээхгүй)
+  customizationProofPhotoUrl String? // ✅ ШИНЭ — Бэлдсэний дараа баталгаажуулах зураг (Google Drive линк)
+  selectedVariations Json?
+
+  // ✅ ШИНЭ: Материал + хэмжээгээр (талбайгаар) үнэлэгдсэн тусгай захиалга
+  materialId            String?
+  material              Material? @relation(fields: [materialId], references: [id])
+  materialNameSnapshot  String? // Материалын нэр (хожим нэр нь өөрчлөгдсөн ч захиалгад хэвээр)
+  widthCm               Float?
+  heightCm              Float?
+  areaCm2               Int? // НЭГ ширхэгийн талбай (см²) — нөөц хасахад ашиглана
+  materialCostSnapshot  Decimal? @db.Decimal(12, 2) // НЭГ ширхэгийн материалын ӨРТӨГ
+  materialPriceSnapshot Decimal? @db.Decimal(12, 2) // НЭГ ширхэгийн материалын БОРЛУУЛАХ үнэ
+  customFieldValues     Json? // ✅ ШИНЭ — Бөглөсөн хувийн мэдээлэл (snapshot): [{key,label,type,unit,value}]
+  // ✅ ШИНЭ: Нэмэлт үйлчилгээ сонгосон эсэх (snapshot)
+  serviceRequested      Boolean  @default(false)
+  serviceLabelSnapshot  String?
+  serviceFeeSnapshot    Decimal? @db.Decimal(12, 2) // НЭГ ширхэгийн үйлчилгээний төлбөр
+
+  @@index([orderId])
+  @@index([productId])
+}
+
+// ============================================================================
+// ✅ ШИНЭ: Тусгай захиалгын Variation бүлэг (жишээ: "Материал", "Өнгө", "Хэмжээ")
+// ============================================================================
+model ProductVariationGroup {
+  id         String                   @id @default(uuid())
+  productId  String
+  product    Product                  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  name       String // "Материал", "Өнгө", "Хэмжээ" гэх мэт
+  required   Boolean                  @default(true)
+  allowMultiple Boolean               @default(false) // ✅ ШИНЭ — Etsy шиг олон утга зэрэг сонгуулах (жишээ: бөмбөлгийн 2-4 өнгө)
+  imageUrl   String? // ✅ ШИНЭ — Бүлгийн ЕРӨНХИЙ жишээ зураг (жишээ: 15 фонтыг нэг дор харуулсан хүснэгт) — Storefront дээр томруулж үзэх боломжтой
+  sortOrder  Int                      @default(0)
+  values     ProductVariationValue[]
+
+  @@index([productId])
+}
+
+model ProductVariationValue {
+  id               String                @id @default(uuid())
+  groupId          String
+  group            ProductVariationGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  value            String // "Хуулга", "Plywood" гэх мэт
+  priceAdjustment  Decimal               @default(0) @db.Decimal(12, 2) // Энэ утгыг сонговол нэмэгдэх/хасагдах үнэ
+  imageUrl         String? // ✅ ШИНЭ — Etsy шиг swatch зураг (Google Drive линк → өөрийн proxy URL болгож хадгална)
+  sortOrder        Int                   @default(0)
+
+  @@index([groupId])
+}
+
+// ============================================================================
+// 7. ТҮРЭЭСИЙН ДЭЛГЭРЭНГҮЙ
+// ============================================================================
+
+enum RentalStatus {
+  BOOKED    // Захиалсан (Онлайнаар эсвэл урьдчилж), бараа гараагүй
+  ACTIVE    // Түрээсэлж аваад явсан
+  RETURNED  // Буцаж ирсэн
+  OVERDUE   // Хугацаа хэтэрсэн боловч буцаагаагүй
+  CANCELLED // ✅ Нэмэгдсэн — цуцлагдсан захиалга боломжийн тооцоонд орохгүй
+}
+
+enum DepositStatus {
+  PENDING            // ✅ Нэмэгдсэн — барьцааны мөнгө хараахан ирээгүй (QPay хүлээгдэж байна)
+  HELD               // Барьцаа бодитоор орж ирсэн, эзэмшигдэж байна
+  PARTIALLY_REFUNDED // Гэмтэл/хожимдлын зардал суутгаад үлдсэнийг буцаасан
+  FULLY_REFUNDED
+  FORFEITED          // Бүтэн хураагдсан
+}
+
+// ✅ ШИНЭ: Барьцаа мөнгөөр (QPay/бэлэн) уу, эсвэл бичиг баримтаар уу гэдгийг ялгана
+enum DepositType {
+  MONEY    // QPay/SocialPay эсвэл кассчин бэлнээр хүлээн авсан
+  DOCUMENT // Иргэний үнэмлэх/бусад бичиг баримт биетээр барьцаалсан
+}
+
+model RentalDetail {
+  id          String @id @default(uuid())
+  orderItemId String @unique
+  orderItem   OrderItem @relation(fields: [orderItemId], references: [id])
+
+  startDate        DateTime
+  endDate          DateTime
+  actualReturn     DateTime?
+  rentalDays       Int
+  dailyRate        Decimal      @db.Decimal(12, 2)
+  rentalStatus     RentalStatus @default(BOOKED)
+
+  overdueDays   Int     @default(0)
+  lateFeePerDay Decimal @default(0) @db.Decimal(12, 2)
+  penaltyFee    Decimal @default(0) @db.Decimal(12, 2) // = overdueDays * lateFeePerDay
+
+  depositAmount       Decimal       @db.Decimal(12, 2)
+  depositStatus       DepositStatus @default(PENDING)
+  depositType         DepositType   @default(MONEY) // ✅ ШИНЭ
+  documentDescription String?                        // ✅ ШИНЭ — жишээ: "Иргэний үнэмлэх"
+  depositRefundAmount Decimal       @default(0) @db.Decimal(12, 2)
+  damageFee           Decimal       @default(0) @db.Decimal(12, 2)
+  damageNote          String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  gatewayTransactions GatewayTransaction[]
+
+  @@index([rentalStatus])
+  @@index([endDate]) // "хугацаа дуусаж буй захиалга" cron query-д
+}
+
+// ============================================================================
+// 8. ТӨЛБӨР (Payment ledger) — ✅ ЗАСВАР #6-ийн үргэлжлэл
+// ----------------------------------------------------------------------------
+// Нэг Order дээр олон Payment мөр байж болно (жишээ: барьцаа CASH-аар,
+// үлдэгдэл QPAY-ээр) — ингэснээр paidAmount яг юунаас бүрдсэнийг мөрдөнө.
+// ============================================================================
+
+enum PaymentMethod {
+  CASH
+  QPAY
+  SOCIALPAY
+  BANK_TRANSFER
+  CARD
+}
+
+enum PaymentType {
+  SALE_PAYMENT
+  DEPOSIT
+  DEPOSIT_REFUND
+  LATE_FEE
+  ERRAND_REFUND // ✅ ШИНЭ — Курьерийн илгээмжийн цуцлалтын буцаалт (Staff гараар буцааж, журналд бүртгэнэ)
+}
+
+model Payment {
+  id      String        @id @default(uuid())
+  orderId String
+  order   Order         @relation(fields: [orderId], references: [id])
+  type    PaymentType
+  method  PaymentMethod
+  amount  Decimal       @db.Decimal(12, 2)
+  note    String?
+  createdAt DateTime    @default(now())
+
+  @@index([orderId])
+  @@index([type])
+}
+
+// ============================================================================
+// 9. ТӨЛБӨРИЙН GATEWAY AUDIT — ✅ ЗАСВАР #5
+// ----------------------------------------------------------------------------
+// QPay/SocialPay-ийн invoice_id, QR, webhook-ийн raw payload-ыг хадгална.
+// Webhook давхардаж ирэхэд invoiceId-аар танин, дахин боловсруулахгүй
+// байх (idempotency) боломжийг олгоно.
+// ============================================================================
+
+enum GatewayProvider {
+  QPAY
+  SOCIALPAY
+}
+
+enum GatewayPurpose {
+  ORDER_PAYMENT
+  DEPOSIT
+  DEPOSIT_REFUND
+  FEATURED_PROMOTION // ✅ ШИНЭ — онцлох байрлалын төлбөр
+}
+
+enum GatewayTxStatus {
+  PENDING
+  PAID
+  FAILED
+  EXPIRED
+}
+
+model GatewayTransaction {
+  id         String          @id @default(uuid())
+  provider   GatewayProvider
+  purpose    GatewayPurpose
+  invoiceId  String          @unique
+  amount     Decimal         @db.Decimal(12, 2)
+  status     GatewayTxStatus @default(PENDING)
+  qrText     String?
+  qrImageUrl String?
+
+  orderId        String?
+  order          Order?        @relation(fields: [orderId], references: [id])
+  rentalDetailId String?
+  promotionId    String? // ✅ ШИНЭ — онцлох байрлалын төлбөр
+  promotion      FeaturedPromotion? @relation(fields: [promotionId], references: [id])
+  rentalDetail   RentalDetail? @relation(fields: [rentalDetailId], references: [id])
+
+  // ✅ ШИНЭ: Захиалгын үндсэн төлбөртэй ХАМТ (нэг QPay/Данс гүйлгээгээр)
+  // төлөгдсөн Барьцаа(нуу)-ны RentalDetail id-үүд. Webhook/гараар
+  // баталгаажихад энэ жагсаалт дахь БҮХ RentalDetail-ийг ч HELD болгоно.
+  combinedDepositRentalIds String[] @default([])
+
+  rawCallback Json?
+  paidAt      DateTime?
+  expiresAt   DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([status])
+  @@index([orderId])
+  @@index([rentalDetailId])
+  @@index([promotionId])
+}
+
+
+// ============================================================================
+// ✅ ШИНЭ: Хүргэлтийн БАТАЛГААЖУУЛАХ ЗУРАГ (хаалганы зураг гэх мэт) — OTP-ээс
+// гадна нэмэлт нотолгоо. Зургийг ТУС ХҮСНЭГТЭД (Order-той хамт ачаалагдахгүй)
+// хадгална; өгөгдлийн сан дээр шууд (Bytes) тул нэмэлт файлын сервер хэрэггүй.
+// ============================================================================
+enum DeliveryProofStage {
+  DELIVERY // Харилцагчид хүргэсэн/өгсөн үеийн зураг
+  RETURN // Түрээсийг харилцагчаас буцаан авсан үеийн зураг
+}
+
+model DeliveryProof {
+  id        String             @id @default(uuid())
+  orderId   String
+  order     Order              @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  stage     DeliveryProofStage
+  mimeType  String
+  imageData Bytes
+  courierId String?
+  createdAt DateTime           @default(now())
+
+  @@unique([orderId, stage])
+  @@index([orderId])
+}
+
+
+// ============================================================================
+// ✅ ШИНЭ: МАТЕРИАЛ (түүхий эд) — тусгай захиалгад талбайгаар (см²) үнэлэгдэнэ.
+// Нөөц, үнэ БҮГД см²-ээр (1 м² = 10,000 см²). Нэг материал хоёр үнэтэй байж болно:
+//   - costPerCm2: жижиг зүсэлтийн өртөг (₮/см²)
+//   - costPerM2 : том хэмжээний өртөг (₮/м²) — талбай bulkThresholdCm2-аас их үед
+// Борлуулах үнэ = өртөг × (1 + markupPercent/100). markupPercent хоосон бол
+// ShopSettings.materialMarkupPercent ашиглана.
+// ============================================================================
+enum MaterialMovementType {
+  PURCHASE_IN // Худалдан авалт (нөөц нэмэх)
+  ORDER_OUT // Тусгай захиалгад зарцуулсан (төлөгдсөн үед)
+  ADJUSTMENT // Тооллогоор засварласан / анхны үлдэгдэл
+}
+
+model Material {
+  id               String   @id @default(uuid())
+  name             String
+  sku              String   @unique // Жишээ: Pl1001
+  bulkSku          String?  @unique // м²-ийн мөрийн код, жишээ: Pl1001-1
+  costPerCm2       Decimal  @db.Decimal(12, 4)
+  costPerM2        Decimal? @db.Decimal(12, 2)
+  bulkThresholdCm2 Int      @default(10000) // Энэ талбайгаас дээш бол м²-ийн үнээр
+  markupPercent    Decimal? @db.Decimal(6, 2) // null → дэлгүүрийн анхдагч хувь
+  stockCm2         Int      @default(0)
+  minStockCm2      Int      @default(0)
+  sheetWidthCm     Int? // Хавтангийн хэмжээ (захиалгын хэмжээг шалгахад)
+  sheetHeightCm    Int?
+  imageUrl         String? // ✅ ШИНЭ — Etsy шиг swatch зураг (Google Drive линк → өөрийн proxy URL болгож хадгална)
+  note             String?
+  isActive         Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  movements  MaterialMovement[]
+  orderItems OrderItem[]
+  allowedForProducts Product[] @relation("ProductAllowedMaterials") // ✅ ШИНЭ
+}
+
+model MaterialMovement {
+  id               String               @id @default(uuid())
+  materialId       String
+  material         Material             @relation(fields: [materialId], references: [id])
+  type             MaterialMovementType
+  quantityCm2      Int // Тэмдэгтэй: нэмэгдэх +, зарцуулах −
+  balanceAfterCm2  Int
+  referenceOrderId String?
+  note             String?
+  createdAt        DateTime             @default(now())
+
+  @@index([materialId])
+}
+
+// ✅ ШИНЭ: Хүргэгчид өгөх үнэлгээ (од). Эхний хувилбарт ЗӨВХӨН курьерийн илгээмжийн илгээгч үнэлнэ.
+// Дундаж/тоо/хүргэсэн тоог хадгалахгүй, асуух бүрд тооцно (өгөгдөл зөрөхгүй).
+model DeliveryRating {
+  id             String   @id @default(uuid())
+  orderId        String   @unique
+  order          Order    @relation(fields: [orderId], references: [id])
+  courierId      String // Үнэлэгдсэн (хүргэсэн) курьер
+  courier        Courier  @relation("CourierRatings", fields: [courierId], references: [id])
+  raterCourierId String? // Үнэлгээ өгсөн (илгээмж илгээсэн) курьер
+  raterCustomerId String? // ✅ ШИНЭ — Үнэлгээ өгсөн дэлгүүрийн харилцагч (storefront хяналтын хуудаснаас)
+  stars          Int // 1..5
+  comment        String?
+  createdAt      DateTime @default(now())
+
+  @@index([courierId])
+}
+
+// ✅ ШИНЭ: Курьерт хүргэлтийн хөлсийг ОРОЙ НЭГ МӨСӨН төлсөн тооцоо (багц). Захиалга бүрийн дүнг (snapshot)
+// Order.courierPayoutAmount-д хадгална, энд нийлбэр/арга/тэмдэглэл — тулгалт, маргааны баримт.
+model CourierPayout {
+  id          String        @id @default(uuid())
+  courierId   String
+  courier     Courier       @relation(fields: [courierId], references: [id])
+  totalAmount Decimal       @db.Decimal(12, 2)
+  orderCount  Int
+  method      PaymentMethod // CASH | BANK_TRANSFER
+  note        String?
+  createdAt   DateTime      @default(now())
+  orders      Order[]
+
+  @@index([courierId, createdAt])
+}
+
+// ✅ ШИНЭ (Etsy шиг marketplace): Худалдагч — өөрийн shop хуудастай, барааны эзэн. Манай курьер худалдагчийн
+// хаягаас (pickupAddress) очиж авна. Бараа худалдагдахад комисс (commissionPercent) суутгагдана.
+enum SellerStatus {
+  PENDING // Бүртгэгдсэн, Staff идэвхжүүлээгүй — storefront-д харагдахгүй
+  ACTIVE // Идэвхтэй — бараа нь storefront-д харагдана, захиалга авна
+  SUSPENDED // Түдгэлзүүлсэн — бараа нууцлагдана, шинэ захиалга авахгүй
+}
+
+model Seller {
+  id                String       @id @default(uuid())
+  name              String // Shop-ийн нэр
+  slug              String       @unique // Нийтийн холбоос: ?shop=slug
+  description       String?
+  logoUrl           String?
+  phone             String // 8 оронтой, нормчилсон
+  pickupAddress     String // Курьер очиж авах хаяг
+  pickupLatitude    Float?
+  pickupLongitude   Float?
+  commissionPercent Float        @default(10) // Борлуулалтаас платформын авах хувь
+  bankName          String?
+  bankAccountNumber String?
+  bankAccountHolder String?
+  status            SellerStatus @default(PENDING)
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+  products          Product[]
+  orders            Order[] // ✅ ШИНЭ — Энэ худалдагчийн захиалгууд
+  // ✅ ШИНЭ: Худалдагчийн портал — Shop-ийн холбоос (slug) + 6 оронтой PIN-ээр нэвтэрнэ (PIN-г Staff үүсгэж НЭГ л удаа харуулна)
+  pinHash           String?
+  pinVersion        Int      @default(0) // PIN солигдоход нэмэгдэнэ — хуучин токен БҮГД хүчингүй болно
+  payouts           SellerPayout[] // Худалдагчид олгосон мөнгөний багц тооцоонууд
+  listingRequests   ProductListingRequest[]
+  promotions        FeaturedPromotion[] // Онцлох байрлалын захиалгууд // Шинэ бараа нэмэх хүсэлтүүд (Staff батлана)
+
+  @@index([status])
+}
+
+// ✅ ШИНЭ: Худалдагчийн захиалгын төлөв. Төлбөр орсны дараа л худалдагч зөвшөөрч, "Бэлэн" болгосны дараа л курьерт санал болно.
+enum SellerOrderStatus {
+  PENDING_PAYMENT // Үүссэн, харилцагч төлөөгүй — худалдагчид хараахан мэдэгдээгүй
+  AWAITING_SELLER // Төлбөр орсон — худалдагч зөвшөөрөх хүлээлт (эцсийн хугацаатай)
+  ACCEPTED // Худалдагч зөвшөөрсөн, бэлтгэж байна
+  READY // Бэлэн — курьерт санал болгоно, курьер худалдагчаас кодоор авна
+  REJECTED // Худалдагч татгалзсан — мөнгө буцна
+  EXPIRED // Хугацаандаа зөвшөөрөөгүй — мөнгө буцна
+}
+
+// ✅ ШИНЭ: Худалдагчид мөнгийг (бараа − комисс) нэг мөсөн олгосон тооцоо. Захиалга бүрийн дүн Order.sellerPayoutAmount-д snapshot болно.
+model SellerPayout {
+  id          String        @id @default(uuid())
+  sellerId    String
+  seller      Seller        @relation(fields: [sellerId], references: [id])
+  totalAmount Decimal       @db.Decimal(12, 2)
+  orderCount  Int
+  method      PaymentMethod // CASH | BANK_TRANSFER
+  note        String?
+  createdAt   DateTime      @default(now())
+  orders      Order[]
+
+  @@index([sellerId, createdAt])
+}
+
+// ✅ ШИНЭ: Худалдагчийн шинэ бараа нэмэх хүсэлт. Staff баталтал Product хүснэгтэд ОРОХГҮЙ (storefront-д алдаатай бараа гарахгүй).
+// Батлахад бараа үүсч (sellerId-тай), productId-д холбогдоно.
+enum ListingRequestStatus {
+  PENDING // Staff шалгаж байна
+  APPROVED // Батлагдсан — бараа үүссэн (productId)
+  REJECTED // Татгалзсан (rejectReason)
+  WITHDRAWN // Худалдагч өөрөө буцаасан
+}
+
+model ProductListingRequest {
+  id           String               @id @default(uuid())
+  sellerId     String
+  seller       Seller               @relation(fields: [sellerId], references: [id])
+  name         String
+  description  String?
+  imageUrl     String?
+  imageUrls    String[]             @default([]) // ✅ ШИНЭ — олон зураг (түлхүүр нь imageUrls[0]); imageUrl нь хуучин хүсэлтүүдэд
+  sellPrice    Decimal              @db.Decimal(12, 2)
+  stockQty     Int
+  status       ListingRequestStatus @default(PENDING)
+  rejectReason String?
+  productId    String? // Батлахад үүссэн барааны id
+  reviewedAt   DateTime?
+  createdAt    DateTime             @default(now())
+
+  @@index([sellerId, status])
+  @@index([status, createdAt])
+}
+
+// ✅ ШИНЭ (Etsy шиг): Барааны үнэлгээ. ЗӨВХӨН бараагаа хүлээн авсан (баталгаажсан) харилцагч — захиалга бүрийн бараа бүрт нэг л үнэлгээ.
+// authorName нь НУУЦЛАГДСАН (эхний үг л) — утас, бүтэн нэр хэзээ ч нийтэд гарахгүй. isHidden — Staff-ийн хяналт (зохисгүй сэтгэгдэл).
+model ProductReview {
+  id         String   @id @default(uuid())
+  productId  String
+  product    Product  @relation(fields: [productId], references: [id])
+  orderId    String
+  customerId String?
+  stars      Int
+  comment    String?
+  authorName String
+  isHidden   Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([orderId, productId])
+  @@index([productId, isHidden, createdAt])
+}
+
+// ✅ ШИНЭ: Онцлох байрлалын БАГЦ (Staff тохируулна): "7 хоног — 15,000₮", "Сар — 50,000₮" гэх мэт, багц бүр өөр үнэтэй.
+model FeaturedPackage {
+  id           String              @id @default(uuid())
+  name         String
+  durationDays Int
+  price        Decimal             @db.Decimal(12, 2)
+  isActive     Boolean             @default(true)
+  sortOrder    Int                 @default(0)
+  createdAt    DateTime            @default(now())
+  promotions   FeaturedPromotion[]
+}
+
+enum PromotionStatus {
+  REQUESTED // Худалдагч хүсэлт илгээсэн — Staff-ийн ЗӨВШӨӨРӨЛ хүлээж байна (байрлал нөөцлөөгүй)
+  APPROVED // Staff зөвшөөрч, байрлалыг НӨӨЦӨЛСӨН — holdUntil хүртэл төлнө
+  PAYMENT_REPORTED // Худалдагч данс руу шилжүүлснээ мэдэгдсэн — Staff шалгана (нөөцлөлт хөлдөнө, 24 цаг)
+  ACTIVE // Төлбөр баталгаажсан (startsAt хүртэл "товлогдсон", дараа нь идэвхтэй)
+  EXPIRED // Хугацаа дууссан
+  REJECTED // Staff татгалзсан
+  CANCELLED // Цуцлагдсан
+  LAPSED // Нөөцлөлтийн хугацаанд төлөөгүй — байрлал чөлөөлөгдсөн
+  PENDING_PAYMENT // ХУУЧИН (өмнөх хувилбар) — REQUESTED мэт харьцана
+}
+
+// ✅ ШИНЭ: Худалдагчийн барааг онцлох ЗАР (урьдчилж төлнө). Үнэ, хугацаа багцаас БЭХЛЭГДСЭН хуулбар (багцын үнэ дараа өөрчлөгдсөн ч нөлөөлөхгүй).
+model FeaturedPromotion {
+  id            String          @id @default(uuid())
+  referenceCode String          @unique // Дансаар шилжүүлэх гүйлгээний утга (FP-123456)
+  sellerId      String
+  seller        Seller          @relation(fields: [sellerId], references: [id])
+  productId     String
+  product       Product         @relation(fields: [productId], references: [id])
+  packageId     String
+  package       FeaturedPackage @relation(fields: [packageId], references: [id])
+  packageName   String
+  durationDays  Int
+  amount        Decimal         @db.Decimal(12, 2)
+  status        PromotionStatus @default(PENDING_PAYMENT)
+  paymentMethod PaymentMethod?
+  paidAt        DateTime?
+  startsAt      DateTime?
+  endsAt        DateTime?
+  note          String?
+  requestedStart  DateTime? // Худалдагчийн хүссэн эхлэх өдөр (УБ-ын 00:00)
+  approvedAt      DateTime?
+  holdUntil       DateTime? // APPROVED/PAYMENT_REPORTED үед: энэ хүртэл байрлал нөөцлөгдсөн
+  reportedAt      DateTime?
+  rejectReason    String?
+  refundDueAmount Decimal?  @db.Decimal(12, 2) // Буцаах ёстой мөнгө (хоцорсон төлбөр, эхлэхээс өмнө цуцалсан)
+  refundedAt      DateTime?
+  gatewayTransactions GatewayTransaction[]
+  cancelReason  String?
+  createdAt     DateTime        @default(now())
+
+  @@index([sellerId, status])
+  @@index([status, endsAt])
+  @@index([productId, status])
+  @@index([status, holdUntil])
+}

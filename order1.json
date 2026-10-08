@@ -1,0 +1,1 @@
+﻿{ "orderType": "POS", "items": [ { "productId": "dafed7a5-4c71-4ad8-9042-a4c9b0c5e4e8", "itemType": "SALE", "quantity": 2 }, { "productId": "2e9def07-0a19-4b1e-8fcb-3b579808b4f0", "itemType": "RENTAL", "quantity": 1, "startDate": "2026-12-01", "endDate": "2026-12-03" } ] }
