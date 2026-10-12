@@ -6,13 +6,15 @@ import { Server as SocketIOServer } from "socket.io";
 import type { Server as HttpServer } from "http";
 import jwt from "jsonwebtoken";
 import type { PosSocketAuthPayload } from "../types/payment.types";
+import { assertStaffTokenPayload } from "../lib/token-guards";
+import { parseAllowedOrigins } from "../lib/cors-origins";
 
 let ioInstance: SocketIOServer | null = null;
 
 export function initSocket(httpServer: HttpServer): SocketIOServer {
   ioInstance = new SocketIOServer(httpServer, {
     cors: {
-      origin: process.env.ALLOWED_ORIGINS?.split(",") || "*",
+      origin: parseAllowedOrigins(process.env.ALLOWED_ORIGINS),
       methods: ["GET", "POST"],
     },
   });
@@ -34,7 +36,8 @@ export function initSocket(httpServer: HttpServer): SocketIOServer {
         socket.data.clientType = "courier";
         socket.data.courierId = payload.courierId;
       } else {
-        const payload = jwt.verify(token, process.env.JWT_SECRET as string) as PosSocketAuthPayload;
+        // Курьер/Худалдагчийн токеныг POS өрөөнд (захиалга, төлбөр, харилцагчийн мэдээлэл) оруулахгүй.
+        const payload = assertStaffTokenPayload<PosSocketAuthPayload>(jwt.verify(token, process.env.JWT_SECRET as string));
         socket.data.clientType = "pos";
         socket.data.staffId = payload.staffId;
         socket.data.storeId = payload.storeId || "default";
