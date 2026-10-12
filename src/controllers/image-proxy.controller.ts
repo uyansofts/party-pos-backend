@@ -20,6 +20,7 @@
 import { Router, Request, Response } from "express";
 import axios from "axios";
 import { UPLOADED_ID, getImageStore } from "../lib/image-upload";
+import { safeImageContentType } from "../lib/image-proxy";
 
 const router = Router();
 
@@ -61,14 +62,20 @@ router.get("/:fileId", async (req: Request, res: Response) => {
       responseType: "arraybuffer",
       maxRedirects: 5, // Drive заримдаа googleusercontent.com руу redirect хийдэг
       timeout: 10_000,
+      maxContentLength: 15 * 1024 * 1024,
     });
 
-    const contentType = response.headers["content-type"] || "image/jpeg";
+    // ✅ АЮУЛГҮЙ БАЙДАЛ: Drive нь эрхгүй файлд HTML хуудас буцаадаг — зөвхөн бодит зураг бол дамжуулна (text/html, svg хэзээ ч гаргахгүй).
+    const contentType = safeImageContentType(response.headers["content-type"]);
+    if (!contentType) return res.status(404).json({ error: "Зураг олдсонгүй (Drive дээр нийтэд нээлттэй эсэхийг шалгана уу)" });
 
     // Browser/CDN түвшинд 1 өдөр кэшлэх — Drive рүү дахин дахин хандахгүй
     res.set({
       "Content-Type": contentType,
       "Cache-Control": "public, max-age=86400",
+      "X-Content-Type-Options": "nosniff",
+      "Content-Security-Policy": "default-src 'none'",
+      "Cross-Origin-Resource-Policy": "cross-origin",
     });
     res.send(Buffer.from(response.data));
   } catch (err) {
