@@ -53,27 +53,34 @@ export interface MarkDepositHeldManuallyParams {
 }
 
 export async function markDepositHeldManually(rentalDetailId: string, params: MarkDepositHeldManuallyParams) {
-  const rental = await prisma.rentalDetail.findUniqueOrThrow({
+  const rental = await prisma.rentalDetail.findUnique({
     where: { id: rentalDetailId },
     include: { orderItem: true },
   });
+  if (!rental) throw new RentalLifecycleError("Түрээс олдсонгүй");
 
   if (rental.depositStatus !== DepositStatus.PENDING) {
     throw new RentalLifecycleError(`Барьцаа аль хэдийн "${rental.depositStatus}" төлөвт байна`);
   }
-  if (params.depositType === "DOCUMENT" && !params.documentDescription) {
+  if (params.depositType !== "MONEY" && params.depositType !== "DOCUMENT") {
+    throw new RentalLifecycleError("Барьцааны төрөл буруу байна (MONEY эсвэл DOCUMENT)");
+  }
+  if (params.depositType === "DOCUMENT" && (typeof params.documentDescription !== "string" || !params.documentDescription.trim())) {
     throw new RentalLifecycleError("Бичиг баримтын нэрийг заавал бичих ёстой");
   }
 
   return prisma.$transaction(async (tx) => {
-    const updated = await tx.rentalDetail.update({
-      where: { id: rentalDetailId },
+    // ✅ ЗАСВАР (race): "уншаад дараа нь шинэчлэх" байсан тул ижил барьцааг хоёр хүсэлт зэрэг бүртгэвэл Payment мөр ДАВХАР
+    // үүсэх (орлого 2 дахин тооцогдох) эрсдэлтэй байв. PENDING → HELD шилжилтийг АТОМ claim-ээр хийнэ.
+    const claim = await tx.rentalDetail.updateMany({
+      where: { id: rentalDetailId, depositStatus: DepositStatus.PENDING },
       data: {
         depositStatus: DepositStatus.HELD,
         depositType: params.depositType === "DOCUMENT" ? DepositType.DOCUMENT : DepositType.MONEY,
-        documentDescription: params.depositType === "DOCUMENT" ? params.documentDescription : null,
+        documentDescription: params.depositType === "DOCUMENT" ? params.documentDescription!.trim() : null,
       },
     });
+    if (claim.count === 0) throw new RentalLifecycleError("Барьцаа аль хэдийн бүртгэгдсэн байна");
 
     // Мөнгөөр авсан бол л Payment түүхэнд бичнэ (баримт бол мөнгө шилжээгүй)
     if (params.depositType === "MONEY") {
@@ -88,7 +95,7 @@ export async function markDepositHeldManually(rentalDetailId: string, params: Ma
       });
     }
 
-    return updated;
+    return tx.rentalDetail.findUniqueOrThrow({ where: { id: rentalDetailId } });
   }, { timeout: 15000 });
 }
 
@@ -117,10 +124,11 @@ export async function markDepositPaid(
  * ирээдүйн клиент (Flutter, өөр backend) үүнийг тойрч гарах боломжгүй.
  */
 export async function markAsPickedUp(rentalDetailId: string) {
-  const rental = await prisma.rentalDetail.findUniqueOrThrow({
+  const rental = await prisma.rentalDetail.findUnique({
     where: { id: rentalDetailId },
     include: { orderItem: true },
   });
+  if (!rental) throw new RentalLifecycleError("Түрээс олдсонгүй");
 
   if (rental.rentalStatus !== RentalStatus.BOOKED) {
     throw new RentalLifecycleError(
@@ -134,10 +142,13 @@ export async function markAsPickedUp(rentalDetailId: string) {
   }
 
   return prisma.$transaction(async (tx) => {
-    const updated = await tx.rentalDetail.update({
-      where: { id: rentalDetailId },
+    // ✅ ЗАСВАР (race): BOOKED → ACTIVE шилжилтийг атом claim-ээр хийнэ — давхар дарахад RENTAL_OUT түүх 2 удаа бичигдэхгүй.
+    // Барьцааны нөхцөлийг мөн WHERE-д давхар шалгана (хооронд өөрчлөгдсөн бол гаргахгүй).
+    const claim = await tx.rentalDetail.updateMany({
+      where: { id: rentalDetailId, rentalStatus: RentalStatus.BOOKED, depositStatus: DepositStatus.HELD },
       data: { rentalStatus: RentalStatus.ACTIVE },
     });
+    if (claim.count === 0) throw new RentalLifecycleError("Түрээсийн төлөв өөрчлөгдсөн байна — дахин шалгана уу");
 
     // Аудитын түүхэнд бараа гарсныг бичнэ (availability тооцоонд НӨЛӨӨЛӨХГҮЙ —
     // тэр логик rentalStatus дээр л тулгуурладаг, энэ зөвхөн түүх).
@@ -151,7 +162,7 @@ export async function markAsPickedUp(rentalDetailId: string) {
       },
     });
 
-    return updated;
+    return tx.rentalDetail.findUniqueOrThrow({ where: { id: rentalDetailId } });
   }, { timeout: 15000 });
 }
 
@@ -160,12 +171,18 @@ export async function markAsPickedUp(rentalDetailId: string) {
  * Хожимдол, гэмтлийг тооцоод depositRefundAmount-ыг тооцно.
  */
 export async function processReturn(rentalDetailId: string, params: ProcessReturnParams) {
-  const { actualReturn, damageFee = 0, damageNote } = params;
+  const { actualReturn, damageNote } = params;
+  // ✅ ЗАСВАР: клиентээс "5000" (string) ирвэл `damageFee + penaltyFee` нь тоон нийлбэр биш тэмдэгт залгалт ("50000") болж,
+  // сөрөг утга ирвэл барьцаанаас ИЛҮҮ мөнгө буцаах (depositRefundAmount > depositAmount) боломжтой байв.
+  const damageFee = Number(params.damageFee ?? 0);
+  if (!Number.isFinite(damageFee) || damageFee < 0) throw new RentalLifecycleError("Гэмтлийн торгууль буруу байна (0 эсвэл түүнээс их тоо)");
+  if (!(actualReturn instanceof Date) || !Number.isFinite(actualReturn.getTime())) throw new RentalLifecycleError("Буцаасан огноо буруу байна");
 
-  const rental = await prisma.rentalDetail.findUniqueOrThrow({
+  const rental = await prisma.rentalDetail.findUnique({
     where: { id: rentalDetailId },
     include: { orderItem: true },
   });
+  if (!rental) throw new RentalLifecycleError("Түрээс олдсонгүй");
 
   if (rental.rentalStatus !== RentalStatus.ACTIVE && rental.rentalStatus !== RentalStatus.OVERDUE) {
     throw new RentalLifecycleError(
@@ -195,8 +212,10 @@ export async function processReturn(rentalDetailId: string, params: ProcessRetur
   }
 
   return prisma.$transaction(async (tx) => {
-    const updated = await tx.rentalDetail.update({
-      where: { id: rentalDetailId },
+    // ✅ ЗАСВАР (race): ACTIVE/OVERDUE → RETURNED шилжилтийг атом claim-ээр хийнэ — давхар дарахад RENTAL_RETURN түүх болон
+    // DEPOSIT_REFUND төлбөрийн мөр 2 удаа бичигдэхгүй.
+    const claim = await tx.rentalDetail.updateMany({
+      where: { id: rentalDetailId, rentalStatus: { in: [RentalStatus.ACTIVE, RentalStatus.OVERDUE] } },
       data: {
         actualReturn,
         overdueDays,
@@ -208,6 +227,7 @@ export async function processReturn(rentalDetailId: string, params: ProcessRetur
         rentalStatus: RentalStatus.RETURNED,
       },
     });
+    if (claim.count === 0) throw new RentalLifecycleError("Түрээсийн төлөв өөрчлөгдсөн байна — буцаалт аль хэдийн бүртгэгдсэн байж болзошгүй");
 
     await tx.stockMovement.create({
       data: {
@@ -222,22 +242,17 @@ export async function processReturn(rentalDetailId: string, params: ProcessRetur
     // Аудитын зорилгоор буцаалтыг Payment хүснэгтэд бичнэ
     // (бодит мөнгө буцаах ажлыг кассаар гараар эсвэл SocialPay P2P-ээр хийнэ)
     if (depositRefundAmount > 0) {
-      const orderItem = await tx.orderItem.findFirst({
-        where: { rentalDetail: { id: rentalDetailId } },
+      await tx.payment.create({
+        data: {
+          orderId: rental.orderItem.orderId,
+          type: PaymentType.DEPOSIT_REFUND,
+          method: PaymentMethod.CASH, // эсвэл бодит буцаасан аргаар солино
+          amount: depositRefundAmount,
+          note: `Барьцаа буцаалт (${overdueDays} хоног хоцорсон, гэмтэл: ${damageFee}₮)`,
+        },
       });
-      if (orderItem) {
-        await tx.payment.create({
-          data: {
-            orderId: orderItem.orderId,
-            type: PaymentType.DEPOSIT_REFUND,
-            method: PaymentMethod.CASH, // эсвэл бодит буцаасан аргаар солино
-            amount: depositRefundAmount,
-            note: `Барьцаа буцаалт (${overdueDays} хоног хоцорсон, гэмтэл: ${damageFee}₮)`,
-          },
-        });
-      }
     }
 
-    return updated;
+    return tx.rentalDetail.findUniqueOrThrow({ where: { id: rentalDetailId } });
   }, { timeout: 15000 });
 }
