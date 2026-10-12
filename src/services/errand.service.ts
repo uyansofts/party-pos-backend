@@ -19,6 +19,7 @@ import { computeCourierPayout } from "../lib/courier-payout";
 import { emitToStore, emitToAllCouriers, emitToCourier } from "../realtime/socket";
 import { sendPushToCourier } from "../lib/push-notifications";
 import { offerDeliveryToAllCouriers } from "./delivery-assignment.service";
+import { checkOtp, OTP_LOCKED_MESSAGE } from "../lib/otp-guard";
 
 export class ErrandError extends Error {
   constructor(message: string) {
@@ -153,13 +154,17 @@ export async function confirmErrandPickedUp(orderId: string, fulfillingCourierId
   if (order.deliveryAssignStatus !== DeliveryAssignStatus.ASSIGNED) {
     throw new ErrandError(`Захиалга "${order.deliveryAssignStatus}" төлөвт байгаа тул авах боломжгүй`);
   }
-  if (order.pickupOtp !== otp) {
+  // ✅ ЗАСВАР: 4 оронтой кодыг таах оролдлогыг хязгаарлана (захиалга тус бүрт 15 мин-д 6 удаа).
+  const otpResult = checkOtp(`pickup:${orderId}`, order.pickupOtp, otp);
+  if (otpResult === "locked") throw new ErrandError(OTP_LOCKED_MESSAGE);
+  if (otpResult !== "ok") {
     throw new ErrandError("Баталгаажуулах код буруу байна");
   }
 
   const now = new Date();
-  const updated = await prisma.order.update({
-    where: { id: orderId },
+  // ✅ ЗАСВАР (race): ASSIGNED → PICKED_UP шилжилтийг атом claim-ээр хийнэ.
+  const claim = await prisma.order.updateMany({
+    where: { id: orderId, courierId: fulfillingCourierId, deliveryAssignStatus: DeliveryAssignStatus.ASSIGNED },
     data: {
       deliveryAssignStatus: DeliveryAssignStatus.PICKED_UP,
       pickedUpAt: now,
@@ -168,6 +173,8 @@ export async function confirmErrandPickedUp(orderId: string, fulfillingCourierId
       locationAlertSentAt: null,
     },
   });
+  if (claim.count === 0) throw new ErrandError("Захиалгын төлөв өөрчлөгдсөн байна — дахин шалгана уу");
+  const updated = await prisma.order.findUniqueOrThrow({ where: { id: orderId } });
   // Курьерийн сүүлийн байршлыг шинэчилнэ — байршил тасрах хяналтын (watcher) суурь цаг болно
   await prisma.courier
     .update({ where: { id: fulfillingCourierId }, data: { currentLatitude: loc.latitude, currentLongitude: loc.longitude, currentLocationUpdatedAt: now } })
