@@ -24,6 +24,7 @@ import { checkout, cancelOrder, CheckoutValidationError, OrderCancellationError 
 import { checkoutCart } from "../services/marketplace-checkout.service"; // ✅ ШИНЭ — сагсыг худалдагчаар хуваана
 import { getGroupRemaining } from "../services/order-payment.service"; // ✅ ШИНЭ
 import { signCustomerToken } from "../lib/customer-tracking";
+import { toPublicOrderView } from "../lib/public-order";
 import { publicProductSellerFilter, normalizeSlug } from "../lib/seller"; // ✅ ШИНЭ
 import { galleryOf } from "../lib/product-images"; // ✅ ШИНЭ — барааны олон зураг
 import { PUBLIC_PRODUCT_INCLUDE, toPublicProduct } from "../lib/public-product"; // ✅ ШИНЭ
@@ -49,7 +50,6 @@ const materialQuoteLimiter = rateLimit({
 import { RentalUnavailableError, checkAvailability } from "../services/rental-availability.service";
 import { createGatewayInvoice, InvalidProviderError, InvalidInvoiceError } from "../services/invoice.service";
 import { reconcileGatewayTransaction, toStatusView } from "../services/gateway-settlement.service";
-import { markDepositHeldManually, RentalLifecycleError } from "../services/deposit.service";
 import { GatewayProvider, GatewayPurpose, PaymentMethod } from "@prisma/client";
 import { emitToStore } from "../realtime/socket";
 import { expireStaleOnlineOrders } from "../services/order-cleanup.service";
@@ -120,7 +120,7 @@ router.get("/products/:id/similar", async (req: Request, res: Response) => {
 // ✅ ШИНЭ: Барааны үнэлгээ (хувилбартай бүлгийн олон productId): ?productIds=a,b,c&limit=10&offset=0
 router.get("/reviews", async (req: Request, res: Response) => {
   try {
-    const ids = String(req.query.productIds ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+    const ids = String(req.query.productIds ?? "").split(",").map((x) => x.trim()).filter(Boolean).slice(0, 50); // хязгааргүй IN жагсаалтаас хамгаална
     res.setHeader("Cache-Control", "public, max-age=30");
     res.json(await listPublicReviews(ids, Number(req.query.limit) || 10, Number(req.query.offset) || 0));
   } catch (err) {
@@ -228,7 +228,11 @@ router.post("/orders", async (req: Request, res: Response) => {
     if (!customerName || !customerPhone) {
       return res.status(400).json({ error: "customerName болон customerPhone заавал шаардлагатай" });
     }
-    if (!items || items.length === 0) {
+    // ✅ ЗАСВАР: төрөл/урт шалгаагүй байсан — объект ирвэл Prisma-д 500 алдаа өгч, хэт урт утга DB-д орно.
+    if (typeof customerName !== "string" || typeof customerPhone !== "string" || customerName.length > 120 || customerPhone.length > 40) {
+      return res.status(400).json({ error: "customerName болон customerPhone буруу хэлбэртэй байна" });
+    }
+    if (!Array.isArray(items) || items.length === 0 || items.length > 100) {
       return res.status(400).json({ error: "Захиалгад дор хаяж 1 бараа байх ёстой" });
     }
 
@@ -293,7 +297,8 @@ router.get("/orders/:id", async (req: Request, res: Response) => {
     });
     if (!order) return res.status(404).json({ error: "Захиалга олдсонгүй" });
 
-    res.json(order);
+    // ✅ АЮУЛГҮЙ БАЙДАЛ: Order мөрийг бүхлээр БИШ, нийтэд зөвшөөрөгдсөн талбаруудыг л буцаана (OTP, комисс, олголт, ажилтны id ил гарахгүй).
+    res.json(toPublicOrderView(order));
   } catch (err) {
     console.error("Захиалга татахад алдаа гарлаа:", err);
     res.status(500).json({ error: "Захиалга татаж чадсангүй" });
@@ -356,10 +361,16 @@ router.get("/payments/status/:gatewayTransactionId", async (req: Request, res: R
   res.set("Cache-Control", "no-store, no-cache, must-revalidate");
 
   // ✅ ШИНЭ: PENDING байвал gateway-ээс шалгаж (5 сек-д нэгээс олонгүй) төлөгдсөн бол хэрэгжүүлнэ — webhook унасан/ирээгүй үед.
-  const tx = await reconcileGatewayTransaction(req.params.gatewayTransactionId);
-  if (!tx) return res.status(404).json({ error: "Олдсонгүй" });
+  // ✅ ЗАСВАР: try/catch байгаагүй — Express 4 нь async алдааг барихгүй тул DB/gateway алдаа гарахад хүсэлт хариугүй өлгөөтэй үлддэг байв.
+  try {
+    const tx = await reconcileGatewayTransaction(req.params.gatewayTransactionId);
+    if (!tx) return res.status(404).json({ error: "Олдсонгүй" });
 
-  res.json(toStatusView(tx));
+    res.json(toStatusView(tx));
+  } catch (err) {
+    console.error("Нээлттэй төлбөрийн төлөв алдаа:", err);
+    res.status(500).json({ error: "Төлөв шалгаж чадсангүй" });
+  }
 });
 
 // ============================================================================
@@ -395,16 +406,38 @@ router.post("/orders/:id/cancel", async (req: Request, res: Response) => {
 // ============================================================================
 router.post("/rentals/:id/deposit/document", async (req: Request, res: Response) => {
   try {
-    const { documentDescription } = req.body;
-    const rentalDetail = await markDepositHeldManually(req.params.id, {
-      depositType: "DOCUMENT",
-      documentDescription,
-    });
-    res.json(rentalDetail);
-  } catch (err) {
-    if (err instanceof RentalLifecycleError) {
-      return res.status(409).json({ error: err.message });
+    // ✅ АЮУЛГҮЙ БАЙДАЛ: өмнө нь энд барьцааг ШУУД HELD болгодог байсан тул худалдан авагч бичиг баримт үлдээгээгүй ч
+    // өөрөө "үлдээсэн" гэж тэмдэглэж, кассчин HELD харж барааг гаргах боломжтой байв. Одоо ЗӨВХӨН ажилтанд мэдэгдэнэ;
+    // кассчин бичиг баримтыг биечлэн шалгаад POS дээрээс "Барьцаа бүртгэх" (/api/rentals/:id/deposit/manual)-ээр баталгаажуулна.
+    const raw = req.body?.documentDescription;
+    const documentDescription = typeof raw === "string" ? raw.trim() : "";
+    if (!documentDescription || documentDescription.length > 200) {
+      return res.status(400).json({ error: "Бичиг баримтын нэрийг заавал бичнэ үү (200 тэмдэгтээс бага)" });
     }
+
+    const rentalDetail = await prisma.rentalDetail.findUnique({
+      where: { id: req.params.id },
+      include: { orderItem: { include: { order: { include: { customer: true } }, product: true } } },
+    });
+    if (!rentalDetail) return res.status(404).json({ error: "Түрээс олдсонгүй" });
+    if (rentalDetail.depositStatus !== "PENDING") return res.status(409).json({ error: `Барьцаа аль хэдийн "${rentalDetail.depositStatus}" төлөвт байна` });
+
+    const order = rentalDetail.orderItem.order;
+    emitToStore(order.storeId, "bank_transfer_claimed", {
+      purpose: "DEPOSIT",
+      orderId: order.id,
+      orderNumber: order.orderNumber,
+      rentalDetailId: rentalDetail.id,
+      productName: rentalDetail.orderItem.product.name,
+      amount: Number(rentalDetail.depositAmount),
+      customerName: order.customer?.name ?? "Танихгүй",
+      customerPhone: order.customer?.phone ?? null,
+      note: `Бичиг баримтаар барьцаалахыг хүссэн: ${documentDescription} — биечлэн шалгаад "Барьцаа бүртгэх"-ээр баталгаажуулна уу`,
+      claimedAt: new Date().toISOString(),
+    });
+
+    res.json({ success: true, pending: true });
+  } catch (err) {
     console.error("Нээлттэй барьцаа бүртгэхэд алдаа гарлаа:", err);
     res.status(500).json({ error: "Барьцаа бүртгэж чадсангүй" });
   }
