@@ -8,6 +8,7 @@
 
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import { assertStaffTokenPayload } from "../lib/token-guards";
 
 const SALT_ROUNDS = 10;
 
@@ -30,5 +31,7 @@ export function generateStaffToken(payload: StaffTokenPayload): string {
 }
 
 export function verifyStaffToken(token: string): StaffTokenPayload {
-  return jwt.verify(token, process.env.JWT_SECRET as string) as StaffTokenPayload;
+  // Курьер (type:"courier") / Худалдагч (type:"seller") токен нь ИЖИЛ JWT_SECRET-ээр гарын үсэглэгдсэн тул
+  // signature ганцаараа хангалтгүй — Staff токен биш бол татгалзана.
+  return assertStaffTokenPayload<StaffTokenPayload>(jwt.verify(token, process.env.JWT_SECRET as string));
 }
