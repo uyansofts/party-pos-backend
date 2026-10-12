@@ -4,7 +4,7 @@
 // ============================================================================
 
 import { Router, Request, Response } from "express";
-import { requireAuth } from "../middleware/auth.middleware";
+import { requireAuth, requireRole } from "../middleware/auth.middleware";
 import {
   SellerOrderError,
   listSellerOrders,
@@ -55,7 +55,7 @@ router.post("/:id/reject", async (req: Request, res: Response) => {
   }
 });
 
-router.post("/:id/refund-done", async (req: Request, res: Response) => {
+router.post("/:id/refund-done", requireRole("ADMIN"), async (req: Request, res: Response) => {
   try {
     res.json(await completeSellerRefund(req.params.id));
   } catch (err) {

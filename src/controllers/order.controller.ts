@@ -5,13 +5,16 @@
 import { Router, Request, Response } from "express";
 import { prisma } from "../lib/prisma";
 import { checkout, cancelOrder, CheckoutValidationError, OrderCancellationError } from "../services/order.service";
+import { refundPaidOrder, OrderRefundError } from "../services/order-refund.service";
 import { markPickedUp, confirmReturnedToShop, DeliveryAssignmentError } from "../services/delivery-assignment.service";
 import { markOrderPaidManually, OrderPaymentError } from "../services/order-payment.service";
 import { expireStaleOnlineOrders } from "../services/order-cleanup.service";
 import { checkUpcomingCustomizationDeadlines } from "./custom-orders.controller";
 import { PaymentMethod } from "@prisma/client";
 import { RentalUnavailableError } from "../services/rental-availability.service";
-import { requireAuth } from "../middleware/auth.middleware";
+import { requireAuth, requireRole, staffHasRole } from "../middleware/auth.middleware";
+import { planStatusChange, assessOrderDeletion } from "../lib/order-guards";
+import { toCents } from "../lib/payment-guards";
 import { emitToCourier } from "../realtime/socket";
 import { isOrderOverdue } from "../lib/order-urgency";
 import { completeErrandRefund, ErrandError } from "../services/errand.service"; // ✅ ШИНЭ
@@ -392,19 +395,39 @@ router.post("/:id/pay/manual", async (req: Request, res: Response) => {
 // хэрэглэгч ирж бараагаа авахад кассчин дарна. POS захиалгад ихэвчлэн
 // шаардлагагүй (төлбөр орсон дор дор олгодог тул автоматаар true болдог).
 // ============================================================================
-router.post("/:id/issue", async (req: Request, res: Response) => {
+router.post("/:id/issue", requireRole("ADMIN", "CASHIER"), async (req: Request, res: Response) => {
   try {
     const order = await prisma.order.findUnique({
       where: { id: req.params.id },
-      include: { items: true },
+      select: { id: true, paymentStatus: true, cancelledAt: true, totalAmount: true, paidAmount: true },
     });
     if (!order) return res.status(404).json({ error: "Захиалга олдсонгүй" });
 
-    const now = new Date();
-    await prisma.orderItem.updateMany({
-      where: { orderId: order.id, itemType: "SALE" },
-      data: { isIssued: true, issuedAt: now },
+    // Цуцлагдсан / буцаагдсан захиалгын барааг олгохгүй.
+    if (order.cancelledAt || order.paymentStatus === "CANCELLED" || order.paymentStatus === "REFUNDED") {
+      return res.status(409).json({ error: "Цуцлагдсан эсвэл буцаагдсан захиалгын барааг олгох боломжгүй" });
+    }
+    // Бүрэн төлөгдсөн байх ёстой. Дүнг order-payment.service-тэй ИЖИЛ аргаар (toCents: Decimal(12,2) төгрөг, Math.round(n*100)) харьцуулна.
+    if (order.paymentStatus !== "PAID" || toCents(Number(order.paidAmount)) < toCents(Number(order.totalAmount))) {
+      return res.status(409).json({ error: "Захиалга бүрэн төлөгдөөгүй тул бараа олгох боломжгүй" });
+    }
+
+    // Төлөв шалгалт + олголтыг НЭГ transaction-д: эхлээд захиалгын мөрийг (төлөв өөрчлөхгүй, нөхцөлтэй) түгжиж PAID/цуцлагдаагүйг баталгаажуулна —
+    // зэрэгцээ cancel/refund түгжээ чөлөөлөгдөх хүртэл хүлээнэ. Дараа нь зөвхөн олгогдоогүй SALE мөрүүдийг тэмдэглэнэ
+    // (isIssued:false) тул давтан хүсэлт өмнөх issuedAt-ийг дарахгүй, давхар дарсан ч нэг л удаа тэмдэглэгдэнэ.
+    const ok = await prisma.$transaction(async (tx) => {
+      const locked = await tx.order.updateMany({
+        where: { id: order.id, paymentStatus: "PAID", cancelledAt: null },
+        data: { paymentStatus: "PAID" },
+      });
+      if (locked.count === 0) return false;
+      await tx.orderItem.updateMany({
+        where: { orderId: order.id, itemType: "SALE", isIssued: false },
+        data: { isIssued: true, issuedAt: new Date() },
+      });
+      return true;
     });
+    if (!ok) return res.status(409).json({ error: "Захиалгын төлөв өөрчлөгдсөн тул бараа олгох боломжгүй" });
 
     res.json({ success: true });
   } catch (err) {
@@ -422,37 +445,47 @@ router.post("/:id/issue", async (req: Request, res: Response) => {
 // ҮР ДАГАВРЫГ дагуулахгүй. Кассчны алдааг ГАРААР засах зориулалттай хэрэгсэл
 // тул болгоомжтой ашиглана уу.
 // ============================================================================
+const num0 = (v: unknown) => Number(v ?? 0) || 0;
 const VALID_STATUSES = ["PENDING", "PARTIALLY_PAID", "PAID", "REFUNDED", "CANCELLED"];
 
-router.patch("/:id/status", async (req: Request, res: Response) => {
+router.patch("/:id/status", requireRole("ADMIN", "CASHIER"), async (req: Request, res: Response) => {
   try {
     const { paymentStatus, method } = req.body;
     if (!VALID_STATUSES.includes(paymentStatus)) {
       return res.status(400).json({ error: `paymentStatus нь ${VALID_STATUSES.join(", ")}-ийн аль нэг байх ёстой` });
     }
 
-    // ✅ ЗАСВАР: "PAID" сонговол ЗӨВХӨН статусыг л соливол зогсохгүй —
-    // markOrderPaidManually()-г дуудаж, Payment мөр үүсгэж, paidAmount-ыг
-    // зөв тооцож, барааны нөөцийг ч буулгана. Эс бөгөөс "Төлбөрийн түүх"
-    // хоосон үлдэж, кассчин "юу ч бүртгэгдээгүй юм шиг" харж байсан.
-    if (paymentStatus === "PAID") {
+    const current = await prisma.order.findUnique({ where: { id: req.params.id }, select: { id: true, paymentStatus: true } });
+    if (!current) return res.status(404).json({ error: "Захиалга олдсонгүй" });
+
+    // ✅ F8: зөвхөн зөвшөөрөгдсөн шилжилт; бусдыг (PAID→PENDING, CANCELLED→PAID …) татгалзана.
+    const plan = planStatusChange(current.paymentStatus, paymentStatus);
+    let refund: Awaited<ReturnType<typeof refundPaidOrder>> | null = null;
+    if (plan.kind === "reject") return res.status(409).json({ error: plan.error });
+
+    if (plan.kind === "pay") {
+      // Payment мөр үүсгэж, paidAmount-ыг зөв тооцож, нөөцийг буулгана.
       await markOrderPaidManually(req.params.id, {
         method: (method as PaymentMethod) ?? PaymentMethod.CASH,
         note: "Захиалгын түүхээс гараар PAID болгосон",
       });
-    } else {
-      await prisma.order.update({
-        where: { id: req.params.id },
-        data: { paymentStatus },
-      });
+    } else if (plan.kind === "cancel") {
+      // cancelOrder: атомик claim + түрээсийн хугацааг суллана
+      await cancelOrder(req.params.id, Boolean(req.body?.confirmedOverdueCancel));
+    } else if (plan.kind === "refund") {
+      const perm = await staffHasRole(req, ["ADMIN"]);
+      if (!perm.ok) return res.status(perm.status).json({ error: perm.error });
+      // ✅ Буцаалтын дүрэм: хайчлагдах (материалтай) барааны мөнгө буцаахгүй, бусад нь буцаж нөөц сэргэнэ (order-refund.service)
+      refund = await refundPaidOrder(req.params.id, req.staff?.staffId);
     }
 
     const order = await prisma.order.findUnique({ where: { id: req.params.id } });
-    res.json(order);
+    res.json(refund ? { ...order, refund } : order);
   } catch (err) {
-    if (err instanceof OrderPaymentError) {
+    if (err instanceof OrderPaymentError || err instanceof OrderCancellationError) {
       return res.status(409).json({ error: err.message });
     }
+    if (err instanceof OrderRefundError) return res.status(err.status).json({ error: err.message });
     console.error("Төлөв солиход алдаа гарлаа:", err);
     res.status(500).json({ error: "Төлөв солиж чадсангүй" });
   }
@@ -537,13 +570,19 @@ router.patch("/:id/courier-fee-paid", async (req: Request, res: Response) => {
 // рүү шилжүүлэхийг (cancel endpoint) зөвлөнө — устгалт нь ТҮҮХЭЭ бүрмөсөн
 // арилгадаг.
 // ============================================================================
-router.delete("/:id", async (req: Request, res: Response) => {
+router.delete("/:id", requireRole("ADMIN", "CASHIER"), async (req: Request, res: Response) => {
   try {
     const order = await prisma.order.findUnique({
       where: { id: req.params.id },
       include: { items: { include: { rentalDetail: true } } },
     });
     if (!order) return res.status(404).json({ error: "Захиалга олдсонгүй" });
+
+    // ✅ F8: төлбөртэй/payout-той захиалгыг ADMIN + force-гүйгээр устгахгүй
+    const perm = await staffHasRole(req, ["ADMIN"]);
+    const verdict = assessOrderDeletion(order as any, { isAdmin: perm.ok, force: req.query.force === "true" || req.body?.force === true });
+    if (!verdict.ok) return res.status(verdict.status).json({ error: verdict.error });
+    if (num0(order.paidAmount) > 0) console.warn(`[audit] PAID order ${order.id} hard-deleted by staff ${req.staff?.staffId}`);
 
     await prisma.$transaction(
       async (tx) => {
@@ -577,7 +616,7 @@ router.delete("/:id", async (req: Request, res: Response) => {
 // олон захиалгаар давтана.
 // body: { orderIds: string[] }
 // ============================================================================
-router.post("/bulk-delete", async (req: Request, res: Response) => {
+router.post("/bulk-delete", requireRole("ADMIN", "CASHIER"), async (req: Request, res: Response) => {
   try {
     const { orderIds } = req.body;
     if (!Array.isArray(orderIds) || orderIds.length === 0) {
@@ -589,6 +628,9 @@ router.post("/bulk-delete", async (req: Request, res: Response) => {
 
     let deletedCount = 0;
     const failedIds: string[] = [];
+    const blocked: Array<{ id: string; reason: string }> = [];
+    const bulkPerm = await staffHasRole(req, ["ADMIN"]);
+    const bulkForce = req.body?.force === true;
 
     for (const orderId of orderIds) {
       try {
@@ -597,6 +639,12 @@ router.post("/bulk-delete", async (req: Request, res: Response) => {
           include: { items: { include: { rentalDetail: true } } },
         });
         if (!order) {
+          failedIds.push(orderId);
+          continue;
+        }
+        const verdict = assessOrderDeletion(order as any, { isAdmin: bulkPerm.ok, force: bulkForce });
+        if (!verdict.ok) {
+          blocked.push({ id: orderId, reason: verdict.error });
           failedIds.push(orderId);
           continue;
         }
@@ -626,7 +674,7 @@ router.post("/bulk-delete", async (req: Request, res: Response) => {
       }
     }
 
-    res.json({ success: true, deletedCount, failedIds });
+    res.json({ success: true, deletedCount, failedIds, blocked });
   } catch (err) {
     console.error("Олноор устгахад алдаа гарлаа:", err);
     res.status(500).json({ error: "Олноор устгаж чадсангүй" });
@@ -638,7 +686,7 @@ router.post("/bulk-delete", async (req: Request, res: Response) => {
 // Staff ГАРААР (бэлнээр/дансаар) буцааж дууссаны дараа НЭГ товчоор бүртгэнэ.
 // body: { method: "CASH" | "BANK_TRANSFER", note?: string }
 // ============================================================================
-router.post("/:id/errand-refund", async (req: Request, res: Response) => {
+router.post("/:id/errand-refund", requireRole("ADMIN"), async (req: Request, res: Response) => {
   try {
     const amount = await completeErrandRefund(req.params.id, req.body?.method, req.body?.note);
     res.json({ success: true, amount });

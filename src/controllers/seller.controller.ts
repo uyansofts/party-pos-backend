@@ -3,7 +3,7 @@
 // ============================================================================
 
 import { Router, Request, Response } from "express";
-import { requireAuth } from "../middleware/auth.middleware";
+import { requireAuth, requireRole } from "../middleware/auth.middleware";
 import { SellerError, listSellers, createSeller, updateSeller, setSellerStatus } from "../services/seller.service";
 import { SellerPortalError, resetSellerPortalPin } from "../services/seller-portal.service";
 import { SellerSettlementError } from "../lib/seller-settlement";
@@ -22,7 +22,7 @@ function fail(err: unknown, res: Response, what: string) {
 }
 
 // ✅ ШИНЭ: Худалдагчийн порталын PIN үүсгэх/сэргээх — PIN-г ЗӨВХӨН ЭНД НЭГ л удаа харуулна (bcrypt-ээр хадгалагдана)
-router.post("/:id/portal-pin", async (req: Request, res: Response) => {
+router.post("/:id/portal-pin", requireRole("ADMIN"), async (req: Request, res: Response) => {
   try {
     res.setHeader("Cache-Control", "no-store");
     res.json(await resetSellerPortalPin(req.params.id));
@@ -68,7 +68,7 @@ router.post("/listings/:id/reject", async (req: Request, res: Response) => {
 
 // ✅ ШИНЭ: ХУДАЛДАГЧИД МӨНГӨ ОЛГОХ (бараа − комисс, хүлээлтийн хугацаатай, багцаар)
 // ✅ ШИНЭ: БҮХ худалдагчид нэг дор олгох (Staff мөнгийг шилжүүлсний дараа бүртгэнэ). :id-тай маршрутаас ӨМНӨ байх ёстой.
-router.post("/payouts/pay-all", async (req: Request, res: Response) => {
+router.post("/payouts/pay-all", requireRole("ADMIN"), async (req: Request, res: Response) => {
   try {
     res.json(await payAllSellers(req.body?.method, req.body?.note));
   } catch (err) {
@@ -100,7 +100,7 @@ router.get("/:id/payouts/history", async (req: Request, res: Response) => {
   }
 });
 
-router.post("/:id/payouts", async (req: Request, res: Response) => {
+router.post("/:id/payouts", requireRole("ADMIN"), async (req: Request, res: Response) => {
   try {
     res.status(201).json(await paySellerBatch(req.params.id, req.body?.orderIds, req.body?.method, req.body?.note));
   } catch (err) {
@@ -132,7 +132,7 @@ router.put("/:id", async (req: Request, res: Response) => {
   }
 });
 
-router.patch("/:id/status", async (req: Request, res: Response) => {
+router.patch("/:id/status", requireRole("ADMIN"), async (req: Request, res: Response) => {
   try {
     res.json(await setSellerStatus(req.params.id, req.body?.status));
   } catch (err) {

@@ -9,44 +9,25 @@
 // ============================================================================
 
 import { Router, Request, Response } from "express";
-import {
-  GatewayProvider,
-  GatewayPurpose,
-  GatewayTxStatus,
-  PayStatus,
-  OrderType,
-  PaymentType,
-  PaymentMethod,
-  StockMovementType,
-} from "@prisma/client";
+import { GatewayProvider, GatewayPurpose } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 
-import { qpayService } from "../services/qpay.service";
-import { socialpayService } from "../services/socialpay.service";
-import { mockGatewayService } from "../services/mock-gateway.service";
-import { createGatewayInvoice, InvalidProviderError } from "../services/invoice.service";
-import { applyOrderPayment } from "../services/order-payment.service";
-import * as depositService from "../services/deposit.service";
-import { emitToStore } from "../realtime/socket";
-import { requireAuth } from "../middleware/auth.middleware";
-import type { PaymentGateway, NewOnlineOrderPayload } from "../types/payment.types";
-import { applyPromotionPayment } from "../services/featured.service"; // ✅ ШИНЭ — онцлох байрлалын төлбөр
+import { createGatewayInvoice, InvalidProviderError, InvalidInvoiceError } from "../services/invoice.service";
+import { requireAuth, requireRole } from "../middleware/auth.middleware";
+import { resolveWebhookKeys } from "../lib/gateway-webhook";
+import {
+  processGatewayWebhook,
+  listUnappliedPayments,
+  reconcileGatewayTransaction,
+  reconcilePendingGatewayTransactions,
+  authorizeStaffForGatewayTx,
+  toStatusView,
+} from "../services/gateway-settlement.service";
 
 const router = Router();
 
-// ---------------------------------------------------------------------------
-// MOCK GATEWAY: .env дотор USE_MOCK_GATEWAY=true үед бодит QPay/SocialPay
-// API-г ДУУДАХГҮЙ, үргэлж "PAID" гэж хариулдаг хуурамч gateway ашиглана.
-// Постман/curl-аар webhook симуляц хийхэд ЗААВАЛ шаардлагатай. (Webhook
-// боловсруулалтад доор ШУУД ашиглагдана — invoice үүсгэх хэсэг нь одоо
-// invoice.service.ts руу шилжсэн тул энд зөвхөн checkPayment-д хэрэгтэй.)
-// ---------------------------------------------------------------------------
-const USE_MOCK = process.env.USE_MOCK_GATEWAY === "true" && process.env.NODE_ENV !== "production";
-
-const PROVIDERS: Record<GatewayProvider, PaymentGateway> = {
-  QPAY: USE_MOCK ? mockGatewayService : qpayService,
-  SOCIALPAY: USE_MOCK ? mockGatewayService : socialpayService,
-};
+// MOCK GATEWAY (USE_MOCK_GATEWAY=true, production-д хэзээ ч асахгүй) нь одоо invoice.service.ts-ийн getPaymentGateway()-д НЭГ газар төвлөрсөн —
+// webhook/polling/reconcile бүгд ижил gateway-г ашиглана.
 
 // ============================================================================
 // 1. НЭХЭМЖЛЭЛ (Invoice/QR) ҮҮСГЭХ
@@ -71,7 +52,7 @@ router.post("/invoice", requireAuth, async (req: Request<{}, {}, CreateInvoiceBo
     const result = await createGatewayInvoice(req.body);
     res.json(result);
   } catch (err) {
-    if (err instanceof InvalidProviderError) {
+    if (err instanceof InvalidProviderError || err instanceof InvalidInvoiceError) {
       return res.status(400).json({ error: err.message });
     }
     console.error("Invoice үүсгэхэд алдаа гарлаа:", err);
@@ -85,14 +66,18 @@ router.post("/invoice", requireAuth, async (req: Request<{}, {}, CreateInvoiceBo
 // ⚠️ ЭНЭ 2 ROUTE-Д requireAuth ХЭЗЭЭ Ч БҮҮ НЭМ — QPay/SocialPay манай
 // JWT-г мэдэхгүй тул callback-аа энгийн (public) байдлаар илгээдэг.
 // ============================================================================
-router.post("/webhook/qpay", async (req: Request, res: Response) => {
+// QPay callback-ийг БОДИТ нь GET-ээр (callback_url-д манай нэмсэн ?senderInvoiceNo=... + QPay-ийн qpay_payment_id-тай) илгээдэг; зарим тохиргоо POST ч ашигладаг — хоёуланг хүлээнэ.
+// QPay "SUCCESS" (200) хариу хүлээдэг. Ямар ч тохиолдолд 200 буцаана (retry storm-оос сэргийлнэ).
+const qpayCallback = async (req: Request, res: Response) => {
   try {
     await handleGatewayWebhook(GatewayProvider.QPAY, req);
   } catch (err) {
     console.error("QPay webhook алдаа:", err);
   }
-  res.status(200).send("OK"); // Provider-т ЯМАРЧ тохиолдолд 200 буцаана (retry storm-оос сэргийлнэ)
-});
+  res.status(200).send("SUCCESS");
+};
+router.get("/webhook/qpay", qpayCallback);
+router.post("/webhook/qpay", qpayCallback);
 
 router.post("/webhook/socialpay", async (req: Request, res: Response) => {
   try {
@@ -104,51 +89,16 @@ router.post("/webhook/socialpay", async (req: Request, res: Response) => {
 });
 
 async function handleGatewayWebhook(provider: GatewayProvider, req: Request): Promise<void> {
-  const invoiceId: string | undefined =
-    req.body.invoice_id || req.body.object_id || (req.query.invoiceId as string | undefined);
+  // Түлхүүр: invoice_id (body/query) эсвэл манай senderInvoiceNo (callback URL-ийн query). Буруу тэмдэгт/объект → алгасна;
+  // нэг түлхүүр олон өөр утгатай (invoice_id ≠ object_id г.м) бол conflict.
+  const keys = resolveWebhookKeys(req.body, req.query);
 
-  if (!invoiceId) {
-    console.warn(`${provider} webhook: invoice_id олдсонгүй`, req.body);
-    return;
-  }
-
-  const gatewayTx = await prisma.gatewayTransaction.findUnique({ where: { invoiceId } });
-  if (!gatewayTx) {
-    console.warn(`${provider} webhook: GatewayTransaction олдсонгүй`, invoiceId);
-    return;
-  }
-
-  // Idempotency: аль хэдийн PAID бол дахин боловсруулахгүй
-  if (gatewayTx.status === GatewayTxStatus.PAID) return;
-
-  // Давхар баталгаажуулалт — webhook-д ганцаараа найдахгүй
-  const gateway = PROVIDERS[provider];
-  const { isPaid, raw } = await gateway.checkPayment(invoiceId);
-  if (!isPaid) {
-    console.warn(`${provider} webhook ирсэн ч checkPayment баталгаажуулж чадсангүй`, invoiceId);
-    return;
-  }
-
-  const updated = await prisma.gatewayTransaction.update({
-    where: { id: gatewayTx.id },
-    data: { status: GatewayTxStatus.PAID, paidAt: new Date(), rawCallback: raw as object },
-  });
-
-  if (updated.purpose === GatewayPurpose.ORDER_PAYMENT && updated.orderId) {
-    const paymentMethod = provider === GatewayProvider.QPAY ? PaymentMethod.QPAY : PaymentMethod.SOCIALPAY;
-    await applyOrderPayment(
-      updated.orderId,
-      Number(updated.amount),
-      paymentMethod,
-      undefined,
-      updated.combinedDepositRentalIds
-    );
-  } else if (updated.purpose === GatewayPurpose.DEPOSIT && updated.rentalDetailId) {
-    await depositService.markDepositPaid(updated.rentalDetailId, updated.id);
-  } else if (updated.purpose === GatewayPurpose.FEATURED_PROMOTION && updated.promotionId) {
-    // ✅ ШИНЭ: Онцлох байрлалын төлбөр → байрлалыг баталгаажуулж, идэвхжүүлнэ (давхар/хоцорсон төлбөрийг сервис өөрөө зохицуулна)
-    await applyPromotionPayment(updated.promotionId, Number(updated.amount), provider === GatewayProvider.QPAY ? "QPAY" : "SOCIALPAY");
-  }
+  // processGatewayWebhook: (1) invoiceId/senderInvoiceNo хоёр өөр гүйлгээ заавал / нэг нь танигдахгүй бол ТАТГАЛЗАНА,
+  // (2) gatewayTx.provider !== provider бол ШУУД ЗОГСООНО (checkPayment хийхгүй, юу ч бичихгүй),
+  // (3) үгүй бол gateway-ээс ДАХИН баталгаажуулж (дүн шалгаж) НЭГ transaction-д claim+apply (idempotent; apply унавал PENDING хэвээр → reconcile).
+  const r = await processGatewayWebhook(provider, keys);
+  if (r.kind === "NOT_PAID") console.warn(`${provider} webhook ирсэн ч checkPayment баталгаажуулж чадсангүй`);
+  else if (r.kind === "UNDERPAID" || r.kind === "UNVERIFIABLE_AMOUNT") console.warn(`${provider} webhook: ${r.kind} — автоматаар хэрэгжүүлсэнгүй (PENDING), Staff шалгана`);
 }
 
 /**
@@ -162,15 +112,48 @@ async function handleGatewayWebhook(provider: GatewayProvider, req: Request): Pr
 // 4. ТӨЛБӨРИЙН ТӨЛӨВ ШАЛГАХ (Flutter polling)
 //    GET /api/payments/status/:gatewayTransactionId
 // ============================================================================
-router.get("/status/:gatewayTransactionId", requireAuth, async (req: Request, res: Response) => {
+router.get("/status/:gatewayTransactionId", requireRole("ADMIN", "CASHIER"), async (req: Request, res: Response) => {
   res.set("Cache-Control", "no-store, no-cache, must-revalidate");
+  try {
+    // Эрх: идэвхтэй ажилтан (ADMIN/CASHIER) БА захиалгын гүйлгээ бол ЗӨВХӨН өөрийн салбарын (storeId) захиалгынх.
+    const access = await authorizeStaffForGatewayTx(req.staff!, req.params.gatewayTransactionId);
+    if (!access.ok) return res.status(access.status).json({ error: access.error });
 
-  const tx = await prisma.gatewayTransaction.findUnique({
-    where: { id: req.params.gatewayTransactionId },
-  });
-  if (!tx) return res.status(404).json({ error: "Олдсонгүй" });
+    // PENDING байвал gateway-ээс шалгаж (5 сек-д нэгээс олонгүй) төлөгдсөн бол хэрэгжүүлнэ — webhook ирээгүй/унасан үед Flutter polling төлбөрийг сэргээнэ.
+    const tx = await reconcileGatewayTransaction(req.params.gatewayTransactionId);
+    if (!tx) return res.status(404).json({ error: "Олдсонгүй" });
+    res.json(toStatusView(tx));
+  } catch (err) {
+    console.error("Төлбөрийн төлөв алдаа:", err);
+    res.status(500).json({ error: "Төлөв шалгаж чадсангүй" });
+  }
+});
 
-  res.json({ status: tx.status, paidAt: tx.paidAt });
+// ============================================================================
+// 5. RECONCILE — webhook ирээгүй / боловсруулалт унасан PENDING гүйлгээг сэргээх (Staff гараар дуудна)
+//    POST /api/payments/reconcile
+// ============================================================================
+// ADMIN: олон гүйлгээг gateway-ээс асууж мөнгөн бүртгэл өөрчилдөг, өндөр эрсдэлтэй ажиллагаа (кассчинд хаалттай).
+router.post("/reconcile", requireRole("ADMIN"), async (_req: Request, res: Response) => {
+  try {
+    res.json(await reconcilePendingGatewayTransactions());
+  } catch (err) {
+    console.error("Reconcile алдаа:", err);
+    res.status(500).json({ error: "Reconcile хийж чадсангүй" });
+  }
+});
+
+// ============================================================================
+// 6. ХЭРЭГЖҮҮЛЖ БОЛООГҮЙ ТӨЛБӨРҮҮД — мөнгө орсон, гэхдээ захиалга цуцлагдсан/аль хэдийн төлөгдсөн (Staff шалгаж буцаана)
+//    GET /api/payments/unapplied
+// ============================================================================
+router.get("/unapplied", requireRole("ADMIN", "CASHIER"), async (_req: Request, res: Response) => {
+  try {
+    res.json(await listUnappliedPayments());
+  } catch (err) {
+    console.error("Unapplied жагсаалт алдаа:", err);
+    res.status(500).json({ error: "Жагсаалт авч чадсангүй" });
+  }
 });
 
 export default router;

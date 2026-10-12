@@ -95,11 +95,17 @@ export async function markDepositHeldManually(rentalDetailId: string, params: Ma
 /**
  * Webhook-оор барьцааны төлбөр баталгаажсаны дараа дуудагдана.
  */
-export async function markDepositPaid(rentalDetailId: string, _gatewayTransactionId: string) {
-  return prisma.rentalDetail.update({
-    where: { id: rentalDetailId },
+export async function markDepositPaid(
+  rentalDetailId: string,
+  _gatewayTransactionId: string,
+  db: { rentalDetail: { updateMany: (args: any) => Promise<{ count: number }> } } = prisma // ✅ ШИНЭ — settlement transaction-ы client-ийг дамжуулж болно
+): Promise<{ held: boolean }> {
+  // ✅ ШИНЭ: ЗӨВХӨН PENDING → HELD (бараа аль хэдийн буцсан/хураагдсан барьцааг HELD болгож дарж бичихгүй). Дахин дуудахад аюулгүй.
+  const r = await db.rentalDetail.updateMany({
+    where: { id: rentalDetailId, depositStatus: DepositStatus.PENDING },
     data: { depositStatus: DepositStatus.HELD }, // мөнгө орж ирсэн тул HELD болно
   });
+  return { held: r.count > 0 };
 }
 
 /**

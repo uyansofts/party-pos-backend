@@ -213,30 +213,63 @@ export async function acceptDelivery(orderId: string, courierId: string) {
  * дуудах шаардлагагүй, шууд ASSIGNED болно (hybrid хуваарилалтын 2-р
  * зам).
  */
-export async function assignDeliveryManually(orderId: string, courierId: string) {
+export async function assignDeliveryManually(orderId: string, courierId: string, opts: { reassign?: boolean } = {}) {
   const courier = await prisma.courier.findUnique({ where: { id: courierId } });
   if (!courier || !courier.isActive) {
     throw new DeliveryAssignmentError("Сонгосон хүргэгч идэвхгүй эсвэл олдсонгүй");
   }
 
   // ✅ ШИНЭ: Staff гараар оноосон ч курьерийн илгээмж ТӨЛӨГДСӨН байх, өөртөө оноогдохгүй байх ёстой
-  const target = await prisma.order.findUnique({ where: { id: orderId }, select: { orderType: true, paymentStatus: true, requestingCourierId: true, sellerId: true, sellerStatus: true } });
-  if (target) assertSellerOrderReadyForCourier(target); // ✅ ШИНЭ — Staff гараар оноохдоо ч худалдагч "Бэлэн" болгоогүй бол боломжгүй
+  const target = await prisma.order.findUnique({ where: { id: orderId }, select: { orderType: true, paymentStatus: true, requestingCourierId: true, sellerId: true, sellerStatus: true, deliveryAssignStatus: true, courierId: true } });
+  if (!target) throw new DeliveryAssignmentError("Захиалга олдсонгүй");
+  // ✅ ШИНЭ (дахин оноох дүрэм): энгийн оноолт зөвхөн хараахан хэнд ч оноогдоогүй (UNASSIGNED / OFFERED) захиалгад.
+  // Аль хэдийн ASSIGNED (курьер accept хийсэн / өмнө оноосон) бол ЗӨВХӨН Staff тусад нь баталгаажуулсан reassign=true үйлдлээр.
+  // Курьер барааг авсан (PICKED_UP) болон түүнээс хойших төлөвт БҮРЭН хориглоно — бараа замд байгаа.
+  const status = target.deliveryAssignStatus as string;
+  if (status === DeliveryAssignStatus.ASSIGNED) {
+    if (!opts.reassign) {
+      throw new DeliveryAssignmentError("Энэ хүргэлт аль хэдийн курьерт оноогдсон байна — өөр курьерт шилжүүлэх бол \"Дахин оноох\" үйлдлийг тусад нь баталгаажуулна уу");
+    }
+    if (target.courierId === courierId) throw new DeliveryAssignmentError("Энэ хүргэлт аль хэдийн сонгосон курьерт оноогдсон байна");
+  } else if (status !== DeliveryAssignStatus.UNASSIGNED && status !== DeliveryAssignStatus.OFFERED) {
+    throw new DeliveryAssignmentError("Энэ захиалга одоогийн төлөвт (курьер барааг авсан, хүргэгдсэн эсвэл цуцлагдсан) курьерт дахин оноох боломжгүй");
+  }
+  const previousCourierId = status === DeliveryAssignStatus.ASSIGNED ? target.courierId : null;
+  assertSellerOrderReadyForCourier(target); // ✅ ШИНЭ — Staff гараар оноохдоо ч худалдагч "Бэлэн" болгоогүй бол боломжгүй
   if (target?.orderType === OrderType.COURIER_ERRAND) {
     if (target.paymentStatus !== PayStatus.PAID) throw new DeliveryAssignmentError("Илгээмжийн төлбөр төлөгдөөгүй тул курьерт оноох боломжгүй");
     if (target.requestingCourierId === courierId) throw new DeliveryAssignmentError("Илгээмжийг илгээгч курьерт нь оноох боломжгүй");
   }
 
-  if (target) await assertShopDeliveryAllowedNow(target.orderType); // ✅ ШИНЭ — Staff гараар оноохдоо ч шөнө дэлгүүрийн хүргэлт гаргахгүй
+  await assertShopDeliveryAllowedNow(target.orderType); // ✅ ШИНЭ — Staff гараар оноохдоо ч шөнө дэлгүүрийн хүргэлт гаргахгүй
 
-  const order = await prisma.order.update({
-    where: { id: orderId },
+  // ✅ ШИНЭ: Атомик claim — дээрх шалгалтаас хойш курьер accept хийсэн / барааг авсан / өөр Staff оноосон бол дарж бичихгүй.
+  // (Өмнө нь болзолгүй update хийж, зэрэгцээ accept-ийг дарж бичдэг байсан.)
+  const allowedNow = previousCourierId !== null
+    ? [DeliveryAssignStatus.ASSIGNED]
+    : [DeliveryAssignStatus.UNASSIGNED, DeliveryAssignStatus.OFFERED];
+  const claimed = await prisma.order.updateMany({
+    where: {
+      id: orderId,
+      deliveryAssignStatus: { in: allowedNow },
+      ...(previousCourierId !== null ? { courierId: previousCourierId } : {}),
+    },
     data: {
       courierId,
       deliveryAssignStatus: DeliveryAssignStatus.ASSIGNED,
       deliveryAcceptedAt: new Date(),
     },
   });
+  if (claimed.count === 0) {
+    throw new DeliveryAssignmentError("Захиалгын төлөв өөрчлөгдсөн тул оноож чадсангүй (өөр курьер авсан эсвэл өөр Staff оноосон) — дахин ачаалаад шалгана уу");
+  }
+  const order = await prisma.order.findUniqueOrThrow({ where: { id: orderId } });
+
+  // Өмнөх курьерт "танаас хасагдлаа" гэж мэдэгдэнэ (дахин оноосон тохиолдолд)
+  if (previousCourierId) {
+    emitToCourier(previousCourierId, "delivery_unassigned_from_you", { orderId, orderNumber: order.orderNumber });
+    await sendPushToCourier(previousCourierId, "Хүргэлт өөр курьерт шилжлээ", `#${order.orderNumber}`, { orderId });
+  }
 
   // ✅ ЗАСВАР: Дутуу байсан — Staff гараар онооход БУСАД курьеруудын
   // "Боломжит хүргэлт" жагсаалтаас энэ захиалгыг АРИЛГАХ шаардлагатай

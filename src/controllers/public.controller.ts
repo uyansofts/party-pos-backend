@@ -47,7 +47,8 @@ const materialQuoteLimiter = rateLimit({
   message: { error: "Хэт олон хүсэлт илгээгдлээ. Түр хүлээгээд дахин оролдоно уу." },
 });
 import { RentalUnavailableError, checkAvailability } from "../services/rental-availability.service";
-import { createGatewayInvoice, InvalidProviderError } from "../services/invoice.service";
+import { createGatewayInvoice, InvalidProviderError, InvalidInvoiceError } from "../services/invoice.service";
+import { reconcileGatewayTransaction, toStatusView } from "../services/gateway-settlement.service";
 import { markDepositHeldManually, RentalLifecycleError } from "../services/deposit.service";
 import { GatewayProvider, GatewayPurpose, PaymentMethod } from "@prisma/client";
 import { emitToStore } from "../realtime/socket";
@@ -336,7 +337,7 @@ router.post("/orders/:id/invoice", async (req: Request, res: Response) => {
 
     res.json(result);
   } catch (err) {
-    if (err instanceof InvalidProviderError) {
+    if (err instanceof InvalidProviderError || err instanceof InvalidInvoiceError) {
       return res.status(400).json({ error: err.message });
     }
     console.error("Нээлттэй invoice үүсгэхэд алдаа гарлаа:", err);
@@ -354,12 +355,11 @@ router.get("/payments/status/:gatewayTransactionId", async (req: Request, res: R
   // хэвээр харагдана.
   res.set("Cache-Control", "no-store, no-cache, must-revalidate");
 
-  const tx = await prisma.gatewayTransaction.findUnique({
-    where: { id: req.params.gatewayTransactionId },
-  });
+  // ✅ ШИНЭ: PENDING байвал gateway-ээс шалгаж (5 сек-д нэгээс олонгүй) төлөгдсөн бол хэрэгжүүлнэ — webhook унасан/ирээгүй үед.
+  const tx = await reconcileGatewayTransaction(req.params.gatewayTransactionId);
   if (!tx) return res.status(404).json({ error: "Олдсонгүй" });
 
-  res.json({ status: tx.status, paidAt: tx.paidAt });
+  res.json(toStatusView(tx));
 });
 
 // ============================================================================

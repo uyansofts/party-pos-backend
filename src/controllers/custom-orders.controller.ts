@@ -7,8 +7,10 @@ import { Router, Request, Response } from "express";
 import { prisma } from "../lib/prisma";
 import { toDriveImageUrl } from "../lib/drive-image";
 import { emitToStore } from "../realtime/socket";
+import { requireAuth } from "../middleware/auth.middleware";
 
 const router = Router();
+router.use(requireAuth); // ✅ F5: харилцагчийн нэр/утас агуулсан тул Staff нэвтрэлт заавал
 
 // ============================================================================
 // GET /api/custom-orders — Тусгай захиалгын мөрүүдийн жагсаалт

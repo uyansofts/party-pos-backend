@@ -13,6 +13,7 @@
 
 import { MaterialMovementType, Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
+import { InsufficientStockError, type Shortage } from "../lib/stock-guards";
 
 export const CM2_PER_M2 = 10_000;
 export const MAX_DIMENSION_CM = 300;
@@ -145,6 +146,38 @@ export async function changeMaterialStock(
   return updated;
 }
 
+/** Тооллого (SET) хийх үед нөөц уншсаны дараа өөрчлөгдсөн (жишээ: зэрэг захиалга материал хассан). */
+export class MaterialStockConflictError extends Error {
+  readonly status = 409;
+  constructor() {
+    super("Нөөц таны уншсаны дараа өөрчлөгдсөн байна. Дахин ачаалж, тооллогоо дахин оруулна уу");
+    this.name = "MaterialStockConflictError";
+  }
+}
+
+/**
+ * Тооллогоор нөөцийг яг `targetCm2` болгож тохируулна (compare-and-set).
+ * ⚠️ Өмнөх хувилбар `delta = target - уншсан` гэж increment хийдэг байсан тул уншилт ба бичилтийн хооронд
+ * зэрэг захиалга материал хасвал эцсийн үлдэгдэл `target` БИШ болдог байсан. Одоо `where stockCm2 = уншсан`
+ * нөхцөлтэй: өөрчлөгдсөн бол MaterialStockConflictError (дуудагч 409 буцаана), буруу тоо бичигдэхгүй.
+ * Материал олдохгүй бол null. Нөөц ба хөдөлгөөн НЭГ transaction-д байх ёстой (дуудагч хариуцна).
+ */
+export async function setMaterialStock(db: MaterialDb, materialId: string, targetCm2: number, opts: { note?: string } = {}) {
+  if (!Number.isInteger(targetCm2) || targetCm2 < 0) throw new MaterialError("Үлдэгдэл сөрөг биш бүхэл тоо байх ёстой");
+  const current = await db.material.findUnique({ where: { id: materialId } });
+  if (!current) return null;
+  const delta = targetCm2 - current.stockCm2;
+  if (delta === 0) return current;
+  const r = await db.material.updateMany({ where: { id: materialId, stockCm2: current.stockCm2 }, data: { stockCm2: targetCm2 } });
+  if (r.count === 0) throw new MaterialStockConflictError();
+  const updated = await db.material.findUnique({ where: { id: materialId } });
+  if (!updated) throw new Error(`MATERIAL_NOT_FOUND:${materialId}`);
+  await db.materialMovement.create({
+    data: { materialId, type: MaterialMovementType.ADJUSTMENT, quantityCm2: delta, balanceAfterCm2: updated.stockCm2, note: opts.note },
+  });
+  return updated;
+}
+
 export interface LowStockMaterial {
   id: string;
   name: string;
@@ -152,27 +185,94 @@ export interface LowStockMaterial {
   minStockCm2: number;
 }
 
+export interface MaterialUsageLine {
+  materialId: string | null;
+  areaCm2: number | null;
+  quantity: number;
+}
+
+/**
+ * Материал тус бүрийн нийт хэрэгцээ (см²) = Σ(areaCm2 × quantity). materialId-аар ЭРЭМБЭЛНЭ —
+ * зэрэгцээ transaction-ууд мөрүүдийг ИЖИЛ дарааллаар түгжвэл deadlock үүсэхгүй.
+ */
+export function totalsByMaterial(items: MaterialUsageLine[]): Array<[string, number]> {
+  const totals = new Map<string, number>();
+  for (const it of items) {
+    if (!it.materialId || !it.areaCm2) continue;
+    const need = Math.ceil(Number(it.areaCm2) * Number(it.quantity));
+    if (!Number.isFinite(need) || need <= 0) continue;
+    totals.set(it.materialId, (totals.get(it.materialId) ?? 0) + need);
+  }
+  return Array.from(totals.entries()).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+/**
+ * ШИНЭЧЛЭХГҮЙ шалгалт (checkout / нэхэмжлэл үүсгэхээс өмнө): материалын нөөц (см²) хүрэх эсэх.
+ * ⚠️ Reservation БАЙХГҮЙ тул энэ нь зөвхөн УРЬДЧИЛСАН шалгалт — зэрэг хоёр захиалга хоёулаа давж болно.
+ * Эцсийн (атомик) хамгаалалт нь consumeMaterialsForOrder (төлбөр бүрэн орох мөчид).
+ */
+export async function assertMaterialsAvailable(db: MaterialDb, items: MaterialUsageLine[]): Promise<void> {
+  const totals = totalsByMaterial(items);
+  if (totals.length === 0) return;
+  const rows = (await db.material.findMany({ where: { id: { in: totals.map(([id]) => id) } } })) as Array<{ id: string; name: string; stockCm2: number }>;
+  const byId = new Map(rows.map((r) => [r.id, r]));
+  const shortages: Shortage[] = [];
+  for (const [id, need] of totals) {
+    const row = byId.get(id);
+    const have = Number.isFinite(Number(row?.stockCm2)) ? Number(row?.stockCm2) : 0;
+    if (need > have) shortages.push({ productId: id, need, have, name: row?.name, unit: "см²" });
+  }
+  if (shortages.length) throw new InsufficientStockError(shortages);
+}
+
+/**
+ * Одоо байгаа захиалгуудын (ба бүлгийн гишүүдийн) материалын нөөц хүрэх эсэх (нэхэмжлэл үүсгэхээс өмнө).
+ * Аль хэдийн БҮРЭН төлөгдсөн (нөөц нь хасагдчихсан) болон цуцлагдсан захиалгыг тооцохгүй — давхар тоолохоос сэргийлнэ.
+ */
+export async function assertOrdersMaterialsAvailable(db: MaterialDb & Pick<Prisma.TransactionClient, "order" | "orderItem">, orderIds: string[]): Promise<void> {
+  if (orderIds.length === 0) return;
+  const orders = (await db.order.findMany({ where: { id: { in: orderIds } } })) as Array<{ id: string; paymentStatus: string; cancelledAt: Date | null }>;
+  const openIds = orders.filter((o) => !o.cancelledAt && (o.paymentStatus === "PENDING" || o.paymentStatus === "PARTIALLY_PAID")).map((o) => o.id);
+  if (openIds.length === 0) return;
+  const items = (await db.orderItem.findMany({ where: { orderId: { in: openIds }, itemType: "SALE" as any } })) as unknown as MaterialUsageLine[];
+  await assertMaterialsAvailable(db, items);
+}
+
 /**
  * Бүрэн төлөгдсөн захиалгын материалын нөөцийг хасна (order-payment.service.ts-ийн
  * SALE_OUT-той АДИЛ агшинд, ЯГ ТЭР транзакц дотор). Доод үлдэгдлээс доош орсон
  * материалуудыг буцаана — дуудагч тал транзакц АМЖИЛТТАЙ дууссаны ДАРАА сануулна.
+ *
+ * ✅ АТОМИК хасалт: `updateMany({ where: { id, stockCm2: { gte } }, data: { decrement } })`. Хүрэхгүй бол
+ * count=0 → InsufficientStockError → дуудагчийн transaction бүхэлдээ буцна (нөөц ХЭЗЭЭ Ч сөрөг болохгүй).
+ * Зэрэг хоёр захиалгаас төлбөр нь ТҮРҮҮЛЖ баталгаажсан нь нөөцийг авна.
  */
 export async function consumeMaterialsForOrder(
   db: MaterialDb,
   order: { id: string; orderNumber: string },
-  items: Array<{ materialId: string | null; areaCm2: number | null; quantity: number }>
+  items: MaterialUsageLine[]
 ): Promise<LowStockMaterial[]> {
-  const totals = new Map<string, number>();
-  for (const it of items) {
-    if (!it.materialId || !it.areaCm2) continue;
-    totals.set(it.materialId, (totals.get(it.materialId) ?? 0) + it.areaCm2 * it.quantity);
-  }
-
   const lowStock: LowStockMaterial[] = [];
-  for (const [materialId, total] of Array.from(totals.entries())) {
-    const updated = await changeMaterialStock(db, materialId, -total, MaterialMovementType.ORDER_OUT, {
-      referenceOrderId: order.id,
-      note: `Тусгай захиалга #${order.orderNumber}`,
+  for (const [materialId, total] of totalsByMaterial(items)) {
+    const r = await db.material.updateMany({
+      where: { id: materialId, stockCm2: { gte: total } },
+      data: { stockCm2: { decrement: total } },
+    });
+    if (r.count === 0) {
+      const cur = await db.material.findUnique({ where: { id: materialId } });
+      throw new InsufficientStockError([{ productId: materialId, need: total, have: Number(cur?.stockCm2 ?? 0), name: cur?.name, unit: "см²" }]);
+    }
+    const updated = await db.material.findUnique({ where: { id: materialId } });
+    if (!updated) throw new Error(`MATERIAL_NOT_FOUND:${materialId}`);
+    await db.materialMovement.create({
+      data: {
+        materialId,
+        type: MaterialMovementType.ORDER_OUT,
+        quantityCm2: -total,
+        balanceAfterCm2: updated.stockCm2,
+        referenceOrderId: order.id,
+        note: `Тусгай захиалга #${order.orderNumber}`,
+      },
     });
     if (updated.stockCm2 < updated.minStockCm2) {
       lowStock.push({ id: updated.id, name: updated.name, stockCm2: updated.stockCm2, minStockCm2: updated.minStockCm2 });

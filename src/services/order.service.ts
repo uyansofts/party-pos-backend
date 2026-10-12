@@ -19,12 +19,14 @@
 
 import { OrderType, OrderItemType, PayStatus } from "@prisma/client";
 import { prisma } from "../lib/prisma";
+import { assertStockAvailable } from "./stock.service";
+import { InsufficientStockError } from "../lib/stock-guards";
 import { applySale } from "../lib/pricing"; // ✅ ШИНЭ — хямдрал: бараа бүрийн ӨӨРИЙН үнийн хэсэгт (суурь, материал, түрээсийн өдрийн үнэ)
 import { reserveRentalWithinTx, RentalUnavailableError } from "./rental-availability.service";
 import { computeDeliveryPolygon, isWithinDeliveryPolygon } from "../lib/delivery-boundary";
 import { computeAutoDeliveryFee } from "../lib/delivery-zone";
 import { resolveDeliveryFee, DeliveryFeeError } from "../lib/delivery-district";
-import { quoteMaterial, MaterialError } from "./material.service";
+import { quoteMaterial, assertMaterialsAvailable, MaterialError } from "./material.service";
 import { resolveNeededByDate, computeIsUrgent, assertCancelAllowed, OrderUrgencyError, parseNeededByDate, assertNeededByNotPast, urgentThresholdHoursFor } from "../lib/order-urgency";
 import {
   parseStoredCustomFieldDefs,
@@ -128,10 +130,15 @@ export async function cancelOrder(orderId: string, confirmedOverdueCancel = fals
 
   await prisma.$transaction(
     async (tx) => {
-      await tx.order.update({
-        where: { id: order.id },
+      // ✅ ШИНЭ: Атомик claim — дээрх шалгалтаас хойш төлбөр орж PAID болсон (эсвэл өөр хүн цуцалсан) бол цуцлахгүй.
+      // (Өмнө нь болзолгүй update хийж, зэрэгцээ орсон төлбөрийг CANCELLED-ээр дарж бичдэг байсан.)
+      const claimed = await tx.order.updateMany({
+        where: { id: order.id, paymentStatus: { in: [PayStatus.PENDING, PayStatus.PARTIALLY_PAID] } },
         data: { paymentStatus: PayStatus.CANCELLED },
       });
+      if (claimed.count === 0) {
+        throw new OrderCancellationError("Захиалгын төлөв өөрчлөгдсөн тул цуцлах боломжгүй (дахин шалгана уу)");
+      }
 
       for (const item of order.items) {
         if (item.rentalDetail) {
@@ -472,6 +479,33 @@ export async function checkout(input: CheckoutInput, options: CheckoutOptions = 
       throw new CheckoutValidationError(
         "Энэ үйлчилгээг газар дээр нь хийх шаардлагатай тул зөвхөн манай курьерийн хүргэлтээр авна — хүргэлтийн хаяг, байршлаа оруулна уу"
       );
+    }
+
+    // ---------- 1б. ✅ F7: Нөөцийн шалгалт (ижил барааны мөрүүдийг НЭГТГЭЖ) — хүрэлцэхгүй бол захиалга үүсэхгүй ----------
+    // Эцсийн (атомик) хамгаалалт төлбөр бүрэн орох мөчид deductSaleStockInTx-д; энд нь хүрэлцэхгүй захиалгыг эхнээс нь зогсооно.
+    {
+      const saleLines = preparedItems
+        .filter((p) => p.itemType === OrderItemType.SALE && !p.materialId)
+        .map((p) => ({ productId: p.productId, quantity: p.quantity }));
+      try {
+        await assertStockAvailable(tx, saleLines);
+      } catch (err) {
+        if (err instanceof InsufficientStockError) throw new CheckoutValidationError(err.message);
+        throw err;
+      }
+      // ✅ Материалаар үнэлэгдэх мөрүүдийн нөөц (см²) — хүрэлцэхгүй бол төлбөр эхлэхээс ӨМНӨ татгалзана.
+      // (Reservation байхгүй тул урьдчилсан шалгалт; эцсийн атомик хамгаалалт consumeMaterialsForOrder-д.)
+      try {
+        await assertMaterialsAvailable(
+          tx,
+          preparedItems
+            .filter((p) => p.itemType === OrderItemType.SALE && p.materialId)
+            .map((p) => ({ materialId: p.materialId ?? null, areaCm2: p.areaCm2 ?? null, quantity: p.quantity }))
+        );
+      } catch (err) {
+        if (err instanceof InsufficientStockError) throw new CheckoutValidationError(err.message);
+        throw err;
+      }
     }
 
     // ---------- 2. Order + OrderItem-үүдийг үүсгэнэ ----------

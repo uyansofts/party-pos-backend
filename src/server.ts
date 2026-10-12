@@ -30,6 +30,7 @@ import reviewRoutes from "./controllers/review.controller"; // ✅ ШИНЭ — 
 import dashboardRoutes from "./controllers/dashboard.controller"; // ✅ ШИНЭ — POS-ын хяналтын самбар
 import featuredRoutes from "./controllers/featured.controller"; // ✅ ШИНЭ — онцлох байрлалын багц, зар (Staff)
 import { startFeaturedExpiryJob } from "./services/featured.service";
+import { describePaymentConfig } from "./lib/payment-config";
 import orderRoutes from "./controllers/order.controller";
 import authRoutes from "./controllers/auth.controller";
 import customerRoutes from "./controllers/customer.controller";
@@ -42,6 +43,7 @@ import mapsRoutes from "./controllers/maps.controller";
 import courierAuthRoutes from "./controllers/courier-auth.controller";
 import customOrdersRoutes from "./controllers/custom-orders.controller";
 import materialsRoutes from "./controllers/materials.controller"; // ✅ ШИНЭ
+import productionRoutes from "./controllers/production.controller"; // ✅ ШИНЭ — зүсэлтийн тооцоолуур / nesting / багцын тоо (Staff нэвтрэлттэй)
 import { staffCourierRouter, courierSelfRouter } from "./controllers/courier.controller";
 import { trackingRouter } from "./controllers/tracking.controller"; // ✅ ШИНЭ — бодит цагийн байршлын газрын зураг
 import { initPushNotifications } from "./lib/push-notifications";
@@ -104,6 +106,7 @@ app.use("/api/maps", mapsRoutes);
 app.use("/api/courier-auth", courierAuthRoutes); // Нээлттэй (нэвтрэх endpoint)
 app.use("/api/custom-orders", customOrdersRoutes); // ✅ ШИНЭ
 app.use("/api/materials", materialsRoutes); // ✅ ШИНЭ — Материал (Staff нэвтрэлттэй)
+app.use("/api/production", productionRoutes); // ✅ ШИНЭ — Cricut/лазер тооцоолуур, nesting, SVG экспорт (Staff нэвтрэлттэй, DB-д бичихгүй)
 app.use("/api/couriers", staffCourierRouter); // Staff-д зориулсан удирдлага
 app.use("/api/courier", courierSelfRouter); // Курьер өөрөө ашиглана
 app.use("/", trackingRouter); // ✅ ШИНЭ — /track (хуудас), /api/track/data (токентой)
@@ -125,6 +128,12 @@ initPushNotifications();
 startDeliveryAlertWatcher(); // ✅ ШИНЭ — Хүргэлтийн хяналт (удаан хүлээлт, түрээсийн сануулга)
 startSellerOrderExpiryJob(); // ✅ ШИНЭ — Худалдагч хугацаандаа зөвшөөрөөгүй захиалгыг автоматаар цуцална
 startFeaturedExpiryJob(); // ✅ ШИНЭ — Төлбөртэй онцлох байрлалын хугацаа дуусахад автоматаар унтраана
+// ✅ ШИНЭ: Төлбөрийн (QPay) тохиргооны оношилгоо — эхлэхэд терминалд харуулна (нууц утгыг харуулахгүй)
+{
+  const pc = describePaymentConfig(process.env);
+  console.log(`💳 Төлбөр: ${pc.mode === "MOCK" ? "MOCK горим (хуурамч, зөвхөн тест)" : "БОДИТ"} | QPay: ${pc.qpay.configured ? "тохирсон ✅" : "ДУТУУ ❌ — " + pc.qpay.missing.join(", ")}`);
+  for (const w of pc.warnings) console.warn(`⚠️  ${w}`);
+}
 
 const PORT = Number(process.env.PORT) || 4000;
 httpServer.listen(PORT, () => {

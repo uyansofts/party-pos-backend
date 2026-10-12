@@ -24,6 +24,7 @@ interface SocialPayInvoiceResponse {
 
 interface SocialPayStatusResponse {
   status: string;
+  amount?: string | number; // ⚠️ банкны баримтаар баталгаажуулах: төлсөн дүн ирдэг эсэх. Ирэхгүй бол төлбөр UNVERIFIABLE_AMOUNT болж, Staff гараар баталгаажуулна.
 }
 
 async function createInvoice({ senderInvoiceNo, amount, description }: CreateInvoiceParams): Promise<CreateInvoiceResult> {
@@ -53,7 +54,9 @@ async function checkPayment(invoiceId: string): Promise<CheckPaymentResult> {
   );
 
   const isPaid = data.status === "SUCCESS" || data.status === "PAID";
-  return { isPaid, raw: data };
+  const n = typeof data.amount === "number" ? data.amount : typeof data.amount === "string" && data.amount.trim() !== "" ? Number(data.amount) : NaN;
+  const paidAmount = Number.isFinite(n) && n > 0 ? n : undefined;
+  return { isPaid, raw: data, paidAmount };
 }
 
 export const socialpayService: PaymentGateway = { createInvoice, checkPayment };

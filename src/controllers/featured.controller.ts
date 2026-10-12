@@ -3,7 +3,7 @@
 // ============================================================================
 
 import { Router, Request, Response } from "express";
-import { requireAuth } from "../middleware/auth.middleware";
+import { requireAuth, requireRole } from "../middleware/auth.middleware";
 import { FeaturedError } from "../lib/featured";
 import { approvePromotion, cancelPromotionByStaff, confirmPromotionPayment, createPackage, deletePackage, getCalendar, listPackages, listPromotions, markRefunded, rejectPromotion, updatePackage } from "../services/featured.service";
 
@@ -19,13 +19,13 @@ function fail(err: unknown, res: Response, what: string) {
 router.get("/packages", async (_req: Request, res: Response) => {
   try { res.json(await listPackages(false)); } catch (err) { fail(err, res, "Багц татаж"); }
 });
-router.post("/packages", async (req: Request, res: Response) => {
+router.post("/packages", requireRole("ADMIN"), async (req: Request, res: Response) => {
   try { res.status(201).json(await createPackage(req.body)); } catch (err) { fail(err, res, "Багц үүсгэж"); }
 });
-router.patch("/packages/:id", async (req: Request, res: Response) => {
+router.patch("/packages/:id", requireRole("ADMIN"), async (req: Request, res: Response) => {
   try { res.json(await updatePackage(req.params.id, req.body)); } catch (err) { fail(err, res, "Багц засаж"); }
 });
-router.delete("/packages/:id", async (req: Request, res: Response) => {
+router.delete("/packages/:id", requireRole("ADMIN"), async (req: Request, res: Response) => {
   try { res.json(await deletePackage(req.params.id)); } catch (err) { fail(err, res, "Багц устгаж"); }
 });
 
@@ -49,7 +49,7 @@ router.post("/promotions/:id/approve", async (req: Request, res: Response) => {
 router.post("/promotions/:id/reject", async (req: Request, res: Response) => {
   try { res.json(await rejectPromotion(req.params.id, req.body?.reason)); } catch (err) { fail(err, res, "Татгалзаж"); }
 });
-router.post("/promotions/:id/refunded", async (req: Request, res: Response) => {
+router.post("/promotions/:id/refunded", requireRole("ADMIN"), async (req: Request, res: Response) => {
   try { res.json(await markRefunded(req.params.id)); } catch (err) { fail(err, res, "Буцаалт бүртгэж"); }
 });
 router.post("/promotions/:id/confirm", async (req: Request, res: Response) => {

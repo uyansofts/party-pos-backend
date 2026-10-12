@@ -21,6 +21,8 @@ export interface CreateInvoiceResult {
 export interface CheckPaymentResult {
   isPaid: boolean;
   raw: unknown;
+  /** Gateway-ийн мэдээлсэн БОДИТ төлсөн дүн (мэдэгдэхгүй бол undefined — дүн шалгахгүй). */
+  paidAmount?: number;
 }
 
 /** QPay болон SocialPay service-үүдийн БАРИМТЛАХ ёстой гэрээ (contract). */

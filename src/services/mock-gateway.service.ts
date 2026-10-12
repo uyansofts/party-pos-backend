@@ -20,6 +20,7 @@
 // шалгалт нэмсэн болно.
 // ============================================================================
 
+import { prisma } from "../lib/prisma";
 import type { PaymentGateway, CreateInvoiceParams, CreateInvoiceResult, CheckPaymentResult } from "../types/payment.types";
 
 async function createInvoice({ senderInvoiceNo, amount }: CreateInvoiceParams): Promise<CreateInvoiceResult> {
@@ -35,7 +36,10 @@ async function createInvoice({ senderInvoiceNo, amount }: CreateInvoiceParams): 
 async function checkPayment(invoiceId: string): Promise<CheckPaymentResult> {
   // ЯМАГТ "төлөгдсөн" гэж хариулна — webhook симуляцийг шууд баталгаажуулна.
   console.warn(`[MOCK GATEWAY] checkPayment("${invoiceId}") → үргэлж isPaid=true буцаана`);
-  return { isPaid: true, raw: { mock: true, invoiceId } };
+  // Дүн шалгалт mock дээр ч ажиллахын тулд нэхэмжилсэн дүнг DB-ээс уншиж "яг төлсөн" гэж буцаана (олдохгүй бол undefined → UNVERIFIABLE_AMOUNT).
+  const row = await prisma.gatewayTransaction.findUnique({ where: { invoiceId }, select: { amount: true } }).catch(() => null);
+  const paidAmount = row ? Number(row.amount) : undefined;
+  return { isPaid: true, raw: { mock: true, invoiceId }, paidAmount };
 }
 
 export const mockGatewayService: PaymentGateway = { createInvoice, checkPayment };

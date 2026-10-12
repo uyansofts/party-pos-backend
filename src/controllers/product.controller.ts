@@ -6,6 +6,8 @@
 // орлого зэрэг) API-уудыг агуулна.
 // ============================================================================
 
+import { adjustSaleStock } from "../services/stock.service";
+import { InsufficientStockError } from "../lib/stock-guards";
 import { Router, Request, Response } from "express";
 import { StockMovementType, Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma";
@@ -362,38 +364,29 @@ router.post("/:id/labor-costs", async (req: Request, res: Response) => {
 router.post("/:id/stock-adjustment", async (req: Request, res: Response) => {
   try {
     const productId = req.params.id;
-    const { type, quantity, staffId, note } = req.body as {
-      type: StockMovementType;
-      quantity: number;
-      staffId?: string;
-      note?: string;
-    };
+    const { type, quantity, note } = req.body as { type: StockMovementType; quantity: number; note?: string };
 
     if (!type || typeof quantity !== "number") {
       return res.status(400).json({ error: "type болон quantity заавал шаардлагатай" });
     }
-
-    // ADJUSTMENT үед quantity сөрөг тоо байж болно (тооллогоор дутсан);
-    // PURCHASE_IN үед эерэг байх ёстой.
+    // ✅ F7: гараар зөвхөн орлого/тооллогын залруулга. SALE_OUT/RENTAL_* зэрэг төрлийг энд хуурамчаар бичихгүй.
+    if (type !== StockMovementType.PURCHASE_IN && type !== StockMovementType.ADJUSTMENT) {
+      return res.status(400).json({ error: "type нь PURCHASE_IN эсвэл ADJUSTMENT байх ёстой" });
+    }
+    if (!Number.isInteger(quantity) || quantity === 0) {
+      return res.status(400).json({ error: "quantity нь 0-ээс ялгаатай бүхэл тоо байх ёстой" });
+    }
     if (type === StockMovementType.PURCHASE_IN && quantity <= 0) {
       return res.status(400).json({ error: "PURCHASE_IN quantity эерэг тоо байх ёстой" });
     }
 
-    const result = await prisma.$transaction(async (tx) => {
-      const updatedProduct = await tx.product.update({
-        where: { id: productId },
-        data: { sellStockQty: { increment: quantity } },
-      });
-
-      const movement = await tx.stockMovement.create({
-        data: { productId, type, quantity, staffId, note },
-      });
-
-      return { updatedProduct, movement };
-    }, { timeout: 15000 });
-
+    // staffId-г body-оос БИШ, баталгаажсан токеноос авна (өөр хүний нэрээр бичих боломжгүй).
+    // Нөөц + StockMovement НЭГ транзакцид; сөрөг залруулга үлдэгдлээс хэтэрвэл 409 (сөрөг үлдэгдэл үүсгэхгүй).
+    const result = await adjustSaleStock(productId, quantity, type, { staffId: req.staff?.staffId, note });
     res.json(result);
-  } catch (err) {
+  } catch (err: any) {
+    if (err instanceof InsufficientStockError) return res.status(409).json({ error: err.message });
+    if (err?.message === "PRODUCT_NOT_FOUND") return res.status(404).json({ error: "Бараа олдсонгүй" });
     console.error("Нөөц тохируулахад алдаа гарлаа:", err);
     res.status(500).json({ error: "Нөөц тохируулж чадсангүй" });
   }

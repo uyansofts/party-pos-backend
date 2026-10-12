@@ -10,8 +10,8 @@ import { MaterialMovementType, Prisma } from "@prisma/client";
 import type { Material } from "@prisma/client";
 import { prisma } from "../lib/prisma";
 import { toDriveImageUrl } from "../lib/drive-image";
-import { requireAuth } from "../middleware/auth.middleware";
-import { changeMaterialStock, seedDefaultMaterials, quoteMaterial, MaterialError, CM2_PER_M2, DEFAULT_MARKUP_PERCENT } from "../services/material.service";
+import { requireAuth, requireRole } from "../middleware/auth.middleware";
+import { changeMaterialStock, setMaterialStock, MaterialStockConflictError, seedDefaultMaterials, quoteMaterial, MaterialError, CM2_PER_M2, DEFAULT_MARKUP_PERCENT } from "../services/material.service";
 
 const router = Router();
 router.use(requireAuth);
@@ -157,7 +157,7 @@ router.post("/quote", async (req: Request, res: Response) => {
 // POST /api/materials/seed-defaults — Sheet-ээс авсан анхны 4 материалыг оруулна
 // (аль хэдийн байгаа SKU-г дарж бичихгүй).
 // ---------------------------------------------------------------------------
-router.post("/seed-defaults", async (_req: Request, res: Response) => {
+router.post("/seed-defaults", requireRole("ADMIN"), async (_req: Request, res: Response) => {
   try {
     res.json(await seedDefaultMaterials());
   } catch (err) {
@@ -216,7 +216,7 @@ router.put("/:id", async (req: Request, res: Response) => {
 // ---------------------------------------------------------------------------
 // DELETE /api/materials/:id — Захиалгад ашиглагдсан бол устгахгүй, идэвхгүй болгоно
 // ---------------------------------------------------------------------------
-router.delete("/:id", async (req: Request, res: Response) => {
+router.delete("/:id", requireRole("ADMIN"), async (req: Request, res: Response) => {
   try {
     const usedCount = await prisma.orderItem.count({ where: { materialId: req.params.id } });
     if (usedCount > 0) {
@@ -254,12 +254,14 @@ router.post("/:id/stock", async (req: Request, res: Response) => {
     if (mode === "SET" && cm2 < 0) return res.status(400).json({ error: "Үлдэгдэл сөрөг байж болохгүй" });
 
     const updated = await prisma.$transaction(async (tx) => {
+      if (mode === "SET") {
+        // ✅ compare-and-set: уншилт ба бичилтийн хооронд нөөц өөрчлөгдвөл MaterialStockConflictError (409)
+        return setMaterialStock(tx, req.params.id, cm2, { note: note ? String(note) : "Тооллогоор тохируулсан" });
+      }
       const current = await tx.material.findUnique({ where: { id: req.params.id } });
       if (!current) return null;
-      const delta = mode === "ADD" ? cm2 : cm2 - current.stockCm2;
-      if (delta === 0) return current;
-      return changeMaterialStock(tx, current.id, delta, mode === "ADD" ? MaterialMovementType.PURCHASE_IN : MaterialMovementType.ADJUSTMENT, {
-        note: note ? String(note) : mode === "ADD" ? "Худалдан авалт" : "Тооллогоор тохируулсан",
+      return changeMaterialStock(tx, current.id, cm2, MaterialMovementType.PURCHASE_IN, {
+        note: note ? String(note) : "Худалдан авалт",
       });
     });
     if (!updated) return res.status(404).json({ error: "Материал олдсонгүй" });
@@ -267,6 +269,7 @@ router.post("/:id/stock", async (req: Request, res: Response) => {
     const settings = await prisma.shopSettings.findUnique({ where: { id: "default" } });
     res.json(toDto(updated, settings?.materialMarkupPercent ?? DEFAULT_MARKUP_PERCENT));
   } catch (err) {
+    if (err instanceof MaterialStockConflictError) return res.status(409).json({ error: err.message });
     console.error("Материалын нөөц өөрчлөхөд алдаа гарлаа:", err);
     res.status(500).json({ error: "Нөөц өөрчилж чадсангүй" });
   }

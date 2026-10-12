@@ -7,7 +7,7 @@
 import { Router, Request, Response } from "express";
 import { DeliveryAssignStatus } from "@prisma/client";
 import { prisma } from "../lib/prisma";
-import { requireAuth } from "../middleware/auth.middleware";
+import { requireAuth, requireRole, staffHasRole } from "../middleware/auth.middleware";
 import { requireCourierAuth } from "../middleware/courier-auth.middleware";
 import { hashPin } from "../services/courier-auth.service";
 import { toDriveImageUrl } from "../lib/drive-image";
@@ -211,7 +211,7 @@ staffCourierRouter.patch("/:id/profile", requireAuth, async (req: Request, res: 
 
 // ✅ ШИНЭ: Staff иргэний үнэмлэхийг нүдэн (биечлэн) шалгаад баталгаажуулна
 // (e-Mongolia албан ёсны API-г ирээдүйд холбох хүртэлх завсрын шийдэл).
-staffCourierRouter.post("/:id/verify", requireAuth, async (req: Request, res: Response) => {
+staffCourierRouter.post("/:id/verify", requireRole("ADMIN"), async (req: Request, res: Response) => {
   try {
     const { status } = req.body; // 'VERIFIED' | 'REJECTED'
     if (!["VERIFIED", "REJECTED"].includes(status)) {
@@ -229,7 +229,7 @@ staffCourierRouter.post("/:id/verify", requireAuth, async (req: Request, res: Re
 });
 
 // ✅ ШИНЭ: Ажилтны барьцаа авах/буцаах — RentalDetail-тэй ИЖИЛ логиктой
-staffCourierRouter.post("/:id/deposit", requireAuth, async (req: Request, res: Response) => {
+staffCourierRouter.post("/:id/deposit", requireRole("ADMIN"), async (req: Request, res: Response) => {
   try {
     const { action, depositType, depositAmount, depositNote } = req.body; // action: 'HOLD' | 'RETURN'
 
@@ -271,7 +271,12 @@ staffCourierRouter.patch("/:id", requireAuth, async (req: Request, res: Response
     const { isActive, pin, isAdmin } = req.body; // ✅ ШИНЭ — isAdmin
     const data: any = {};
     if (isActive != null) data.isActive = isActive;
-    if (isAdmin != null) data.isAdmin = Boolean(isAdmin); // ✅ ШИНЭ
+    if (isAdmin != null) {
+      // ✅ F5: курьерт "Бүх хүргэлт" админ горим олгох нь зөвхөн ADMIN-ийн эрх
+      const perm = await staffHasRole(req, ["ADMIN"]);
+      if (!perm.ok) return res.status(perm.status).json({ error: perm.error });
+      data.isAdmin = Boolean(isAdmin);
+    }
     if (pin) {
       if (!/^\d{4,6}$/.test(pin)) return res.status(400).json({ error: "PIN 4-6 оронтой тоо байх ёстой" });
       data.pinHash = await hashPin(pin);
@@ -323,7 +328,7 @@ staffCourierRouter.get("/:id/payouts/history", requireAuth, async (req: Request,
   }
 });
 
-staffCourierRouter.post("/:id/payouts", requireAuth, async (req: Request, res: Response) => {
+staffCourierRouter.post("/:id/payouts", requireRole("ADMIN"), async (req: Request, res: Response) => {
   try {
     const result = await payCourierBatch(req.params.id, req.body?.orderIds, req.body?.method, req.body?.note);
     res.status(201).json(result);
@@ -355,10 +360,11 @@ staffCourierRouter.post("/tracking-link", requireAuth, async (req: Request, res:
 
 staffCourierRouter.post("/assign", requireAuth, async (req: Request, res: Response) => {
   try {
-    const { orderId, courierId } = req.body;
+    const { orderId, courierId, reassign } = req.body;
     if (!orderId || !courierId) return res.status(400).json({ error: "orderId, courierId заавал шаардлагатай" });
 
-    const order = await assignDeliveryManually(orderId, courierId);
+    // reassign: ЗААВАЛ boolean true (аль хэдийн оноогдсон хүргэлтийг өөр курьерт шилжүүлэх Staff-ийн тусдаа баталгаажуулалт)
+    const order = await assignDeliveryManually(orderId, courierId, { reassign: reassign === true });
     res.json(order);
   } catch (err) {
     if (err instanceof DeliveryAssignmentError) return res.status(409).json({ error: err.message });

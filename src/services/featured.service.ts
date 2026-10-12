@@ -7,7 +7,8 @@
 // ============================================================================
 
 import { prisma } from "../lib/prisma";
-import { createGatewayInvoice, getPaymentGateway } from "./invoice.service";
+import { createGatewayInvoice } from "./invoice.service";
+import { confirmAndSettle } from "./gateway-settlement.service"; // циклик импорт: зөвхөн дуудах үед ашиглана
 import {
   AWAITING_APPROVAL, DAY_MS, FeaturedError, MAX_OPEN_PER_SELLER, MAX_LEAD_DAYS, MIN_LEAD_DAYS, OPEN_STATUSES, REPORTED_HOLD_HOURS, REQUEST_TTL_DAYS,
   daysLeft, effectiveStatus, generateReferenceCode, isFeaturedNow, isStaffForeverFeatured, lastDayKey, normalizeHoldMinutes, normalizeSlotLimit, ubKey, ubMidnightMs,
@@ -228,11 +229,8 @@ export async function refreshGatewayPayment(sellerId: string, id: string, now: D
   if (p.status !== "ACTIVE") {
     const tx: any = await prisma.gatewayTransaction.findFirst({ where: { promotionId: id, status: "PENDING" as any }, orderBy: { createdAt: "desc" } } as any);
     if (tx) {
-      const r = await getPaymentGateway(tx.provider).checkPayment(tx.invoiceId);
-      if (r.isPaid) {
-        const claimed = await prisma.gatewayTransaction.updateMany({ where: { id: tx.id, status: "PENDING" as any }, data: { status: "PAID" as any, paidAt: now, rawCallback: r.raw as any } });
-        if (claimed.count === 1) await applyPromotionPayment(id, num(tx.amount), tx.provider, now);
-      }
+      // Дүн шалгалт + атомик claim + захиалгын нэгэн адил revert-тэй нэгдсэн зам (өмнө нь дүн шалгалтгүй, apply унавал PAID үлддэг байсан).
+      await confirmAndSettle(tx);
     }
   }
   return sellerView(await loadOwn(sellerId, id), now);

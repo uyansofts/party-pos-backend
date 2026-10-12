@@ -26,7 +26,7 @@ interface QPayInvoiceResponse {
 
 interface QPayPaymentCheckResponse {
   count: number;
-  rows: Array<{ payment_status: string }>;
+  rows: Array<{ payment_status: string; payment_amount?: string | number }>;
 }
 
 // -------- Token кэш (санах ойд; олон instance ажиллуулбал Redis руу шилжүүлнэ) --------
@@ -95,7 +95,12 @@ async function checkPayment(invoiceId: string): Promise<CheckPaymentResult> {
   );
 
   const isPaid = data.count > 0 && data.rows?.some((r) => r.payment_status === "PAID");
-  return { isPaid, raw: data };
+  // Төлсөн дүн = PAID мөр бүрийн payment_amount-ийн нийлбэр. Аль нэг PAID мөрөнд дүн байхгүй/хоосон/тоо биш/0-ээс бага-тэнцүү бол
+  // нийлбэр БАТАЛГААГҮЙ → undefined (settlement нь UNVERIFIABLE_AMOUNT гэж үзнэ). null/"" нь Number()-ээр 0 болдгийг тусгайлан хаана.
+  const paidRows = (data.rows ?? []).filter((r) => r.payment_status === "PAID");
+  const amounts = paidRows.map((r) => (typeof r.payment_amount === "number" ? r.payment_amount : typeof r.payment_amount === "string" && r.payment_amount.trim() !== "" ? Number(r.payment_amount) : NaN));
+  const paidAmount = amounts.length > 0 && amounts.every((n) => Number.isFinite(n) && n > 0) ? amounts.reduce((a, b) => a + b, 0) : undefined;
+  return { isPaid, raw: data, paidAmount };
 }
 
 export const qpayService: PaymentGateway = { createInvoice, checkPayment };

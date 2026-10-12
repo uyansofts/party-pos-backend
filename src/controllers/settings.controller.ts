@@ -9,7 +9,7 @@
 import { parseDistrictZones, parseKhorooZones, districtFee } from "../lib/delivery-district"; // ✅ ШИНЭ
 import { Router, Request, Response } from "express";
 import { prisma } from "../lib/prisma";
-import { requireAuth } from "../middleware/auth.middleware";
+import { requireAuth, requireRole } from "../middleware/auth.middleware";
 import { computeDeliveryPolygon, isWithinDeliveryPolygon } from "../lib/delivery-boundary";
 import { computeAutoDeliveryFee } from "../lib/delivery-zone";
 
@@ -188,7 +188,7 @@ router.get("/boundary-rejections", requireAuth, async (req: Request, res: Respon
   }
 });
 
-router.put("/", requireAuth, async (req: Request, res: Response) => {
+router.put("/", requireRole("ADMIN"), async (req: Request, res: Response) => {
   try {
     const {
       bankName,
@@ -297,7 +297,7 @@ router.get("/boundary-points", async (req: Request, res: Response) => {
   }
 });
 
-router.post("/boundary-points", requireAuth, async (req: Request, res: Response) => {
+router.post("/boundary-points", requireRole("ADMIN"), async (req: Request, res: Response) => {
   try {
     const { latitude, longitude, label } = req.body;
     if (latitude == null || longitude == null) {
@@ -318,7 +318,7 @@ router.post("/boundary-points", requireAuth, async (req: Request, res: Response)
   }
 });
 
-router.delete("/boundary-points/:id", requireAuth, async (req: Request, res: Response) => {
+router.delete("/boundary-points/:id", requireRole("ADMIN"), async (req: Request, res: Response) => {
   try {
     await prisma.deliveryBoundaryPoint.delete({ where: { id: req.params.id } });
     res.json({ success: true });
@@ -331,7 +331,7 @@ router.delete("/boundary-points/:id", requireAuth, async (req: Request, res: Res
 // ✅ ШИНЭ: Бүх цэгийн ДАРААЛЛЫГ (sortOrder) нэг дор шинэчлэх — staff
 // жагсаалтыг дээш/доош дараад дараалал өөрчлөхөд ашиглана.
 // body: { orderedIds: string[] } — эхнийх нь sortOrder=0, дараагийнх нь 1, г.м.
-router.put("/boundary-points/reorder", requireAuth, async (req: Request, res: Response) => {
+router.put("/boundary-points/reorder", requireRole("ADMIN"), async (req: Request, res: Response) => {
   try {
     const { orderedIds } = req.body;
     if (!Array.isArray(orderedIds)) {
