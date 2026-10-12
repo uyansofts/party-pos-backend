@@ -14,6 +14,7 @@
 
 import { Router, Request, Response } from "express";
 import axios from "axios";
+import { resolveMapsPage, MapsFetcher } from "../lib/maps-url";
 
 const router = Router();
 
@@ -30,20 +31,28 @@ function isPlausibleMnCoord(lat: number, lng: number): boolean {
  * Богино холбоос (maps.app.goo.gl/goo.gl/maps) бол redirect-ийг дагаж
  * бодит (урт) URL БОЛОН хуудасны HTML-ийг буцаана.
  */
+// ✅ АЮУЛГҮЙ БАЙДАЛ (SSRF): энэ endpoint нэвтрэлтгүй тул ЗӨВХӨН Google-ийн газрын зургийн хаяг руу, redirect бүрийг
+// гараар дагаж HOP БҮРД шалгана (lib/maps-url). Дотоод сүлжээ/metadata/localhost руу хэзээ ч хүсэлт явуулахгүй.
+const mapsFetcher: MapsFetcher = async (u) => {
+  const response = await axios.get(u, {
+    maxRedirects: 0, // redirect-ийг resolveMapsPage өөрөө (шалгаж) дагана
+    validateStatus: () => true,
+    timeout: 10000,
+    maxContentLength: 3_000_000,
+    responseType: "text",
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    },
+  });
+  const loc = response.headers?.location;
+  return { status: response.status, location: typeof loc === "string" ? loc : undefined, body: typeof response.data === "string" ? response.data : null };
+};
+
 async function fetchResolvedPage(url: string): Promise<{ finalUrl: string; html: string | null }> {
   try {
-    const response = await axios.get(url, {
-      maxRedirects: 8,
-      validateStatus: () => true,
-      timeout: 10000,
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-      },
-    });
-    const finalUrl = (response.request as any)?.res?.responseUrl || url;
-    const html = typeof response.data === "string" ? response.data : null;
-    return { finalUrl, html };
+    const r = await resolveMapsPage(url, mapsFetcher);
+    return { finalUrl: r.finalUrl, html: r.html };
   } catch (err) {
     console.error("Maps линк татахад алдаа гарлаа:", err);
     return { finalUrl: url, html: null };
@@ -92,7 +101,7 @@ function extractLatLng(text: string): { latitude: number; longitude: number } | 
 router.post("/resolve", async (req: Request, res: Response) => {
   try {
     const { url } = req.body;
-    if (!url || typeof url !== "string") {
+    if (!url || typeof url !== "string" || url.length > 2000) {
       return res.status(400).json({ success: false, error: "url заавал шаардлагатай" });
     }
 
