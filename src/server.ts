@@ -17,6 +17,7 @@ import cors from "cors";
 import rateLimit from "express-rate-limit";
 import http from "http";
 import { initSocket } from "./realtime/socket";
+import { parseAllowedOrigins } from "./lib/cors-origins";
 
 import paymentRoutes from "./controllers/payment.controller";
 import rentalRoutes from "./controllers/rental.controller";
@@ -57,11 +58,17 @@ const app = express();
 // тааруулж болно (тайлбарыг доор харна уу); байхгүй бол хөгжүүлэлтэд ЯМАРЧ
 // origin-ийг зөвшөөрнө ("*").
 // ---------------------------------------------------------------------------
-app.use(
-  cors({
-    origin: process.env.ALLOWED_ORIGINS?.split(",") || "*",
-  })
-);
+// ✅ ЗАСВАР: reverse proxy (Render/Fly/nginx...)-ийн ард ажиллаж байвал TRUST_PROXY=1 тавина — эс бөгөөс БҮХ хэрэглэгч proxy-ийн
+// ИЖИЛ IP-тэй харагдаж, rate-limit нэгдсэн нэг хувин болно (100 хүсэлт/15 мин БҮХ хэрэглэгчид нийлээд). Тохируулаагүй бол өмнөх үйлдэл хэвээр.
+if (process.env.TRUST_PROXY) {
+  const tp = process.env.TRUST_PROXY.trim();
+  app.set("trust proxy", /^\d+$/.test(tp) ? Number(tp) : tp === "true" ? true : tp);
+}
+const corsOrigin = parseAllowedOrigins(process.env.ALLOWED_ORIGINS);
+if (corsOrigin === "*" && process.env.NODE_ENV === "production") {
+  console.warn("⚠️  ALLOWED_ORIGINS тохируулаагүй — production дээр ямар ч origin-д CORS нээлттэй байна. .env-д ALLOWED_ORIGINS=https://таны-домэйн тавина уу.");
+}
+app.use(cors({ origin: corsOrigin }));
 app.use(express.json({ limit: "6mb" })); // ✅ Хүргэлтийн баталгаажуулах зураг (base64) багтахын тулд
 
 app.use("/api/auth", authRoutes); // НЭЭЛТТЭЙ — нэвтрэхийн өмнө JWT байхгүй тул
@@ -89,9 +96,22 @@ const publicApiLimiter = rateLimit({
   max: 100,
   standardHeaders: true,
   legacyHeaders: false,
-  skip: (req) => req.path === "/materials/quote", // ✅ ШИНЭ — материалын урьдчилсан үнэ тусдаа (илүү өндөр) хязгаартай
+  // /materials/quote — тусдаа (илүү өндөр) хязгаартай. /payments/status — storefront 3 сек тутам асууна (15 мин-д ~300) тул
+  // нийтлэг 100/15мин хязгаарт 5 минутын дотор хүрч төлбөрийн төлөв харагдахаа болино → доорх тусдаа хязгаартай.
+  skip: (req) => req.path === "/materials/quote" || req.path.startsWith("/payments/status/"),
   message: { error: "Хэт олон хүсэлт илгээгдлээ. Түр хүлээгээд дахин оролдоно уу." },
 });
+const paymentStatusLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60, // минутад 60 (3 сек тутмын polling = 20/мин, олон таб/төхөөрөмжид ч хангалттай)
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Хэт олон хүсэлт илгээгдлээ. Түр хүлээгээд дахин оролдоно уу." },
+});
+app.use("/api/public/payments/status", paymentStatusLimiter);
+
+// /api/maps/resolve нэвтрэлтгүй, гадагш HTTP хүсэлт явуулдаг тул тусдаа хатуу хязгаар (минутад 20).
+app.use("/api/maps", rateLimit({ windowMs: 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false, message: { success: false, error: "Хэт олон хүсэлт илгээгдлээ. Түр хүлээгээд дахин оролдоно уу." } }));
 app.use("/api/public/order-tracking", customerTrackingRouter); // ✅ ШИНЭ — өөрийн rate-limit-тэй, токентой
 app.use("/api/public", publicApiLimiter, publicRoutes);
 
@@ -133,6 +153,14 @@ startFeaturedExpiryJob(); // ✅ ШИНЭ — Төлбөртэй онцлох б
   const pc = describePaymentConfig(process.env);
   console.log(`💳 Төлбөр: ${pc.mode === "MOCK" ? "MOCK горим (хуурамч, зөвхөн тест)" : "БОДИТ"} | QPay: ${pc.qpay.configured ? "тохирсон ✅" : "ДУТУУ ❌ — " + pc.qpay.missing.join(", ")}`);
   for (const w of pc.warnings) console.warn(`⚠️  ${w}`);
+}
+
+// JWT_SECRET нь ажилтан/курьер/худалдагчийн токен БОЛОН харилцагчийн хяналтын токены гарын үсгийн ГАНЦ түлхүүр.
+// Байхгүй бол нэвтрэлт, захиалгын токен бүгд унана; богино бол таамаглах боломжтой болно — эхлэхэд анхааруулна.
+{
+  const js = process.env.JWT_SECRET;
+  if (!js) console.error("❌ JWT_SECRET тохируулаагүй байна — нэвтрэлт болон захиалгын хяналтын токен ажиллахгүй (.env-д санамсаргүй 32+ тэмдэгт тавина уу)");
+  else if (js.length < 32) console.warn("⚠️  JWT_SECRET 32 тэмдэгтээс богино байна — санамсаргүй урт утга (жишээ нь `openssl rand -hex 32`) ашиглана уу");
 }
 
 const PORT = Number(process.env.PORT) || 4000;
