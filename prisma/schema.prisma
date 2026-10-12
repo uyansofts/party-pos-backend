@@ -873,6 +873,7 @@ model GatewayTransaction {
   provider   GatewayProvider
   purpose    GatewayPurpose
   invoiceId  String          @unique
+  senderInvoiceNo String?    @unique // ✅ ШИНЭ — манай үүсгэсэн дугаар. QPay callback-д (GET ?senderInvoiceNo=...) гүйлгээг олоход
   amount     Decimal         @db.Decimal(12, 2)
   status     GatewayTxStatus @default(PENDING)
   qrText     String?
