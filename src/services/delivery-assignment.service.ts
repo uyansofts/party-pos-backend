@@ -13,6 +13,7 @@ import { computeCourierPayout } from "../lib/courier-payout";
 import { findUnpaidDeliveredErrand, unpaidErrandMessage } from "./errand-guards";
 import { courierDisplayName, courierStaffLabel } from "../lib/courier-identity";
 import { normalizeNightSettings, isNightNow, nightHoldMessage } from "../lib/night-hours";
+import { checkOtp, OTP_LOCKED_MESSAGE } from "../lib/otp-guard";
 
 
 export class DeliveryAssignmentError extends Error {}
@@ -312,10 +313,13 @@ export async function markPickedUp(orderId: string) {
     throw new DeliveryAssignmentError("Энэ захиалга одоогийн төлөвт 'Дэлгүүрээс авсан' гэж тэмдэглэх боломжгүй");
   }
 
-  const updated = await prisma.order.update({
-    where: { id: orderId },
+  // ✅ ЗАСВАР (race): ASSIGNED → PICKED_UP шилжилтийг атом claim-ээр хийнэ (давхар дарахад мэдэгдэл 2 удаа явахгүй).
+  const claim = await prisma.order.updateMany({
+    where: { id: orderId, deliveryAssignStatus: DeliveryAssignStatus.ASSIGNED },
     data: { deliveryAssignStatus: DeliveryAssignStatus.PICKED_UP, pickedUpAt: new Date() },
   });
+  if (claim.count === 0) throw new DeliveryAssignmentError("Захиалгын төлөв өөрчлөгдсөн байна — дахин шалгана уу");
+  const updated = await prisma.order.findUniqueOrThrow({ where: { id: orderId } });
 
   // Курьер апп-д ШУУД мэдэгдэж, "Хүргэсэн" товч идэвхжинэ.
   if (updated.courierId) {
@@ -361,7 +365,10 @@ export async function confirmDeliveryStep(orderId: string, courierId: string, ot
 
   if (order.deliveryAssignStatus === DeliveryAssignStatus.PICKED_UP) {
     // ---- 1-р алхам: Хүргэсэн/Өгсөн (deliveryOtp-оор шалгана) ----
-    if (!order.deliveryOtp || otp !== order.deliveryOtp) {
+    // ✅ ЗАСВАР: 4 оронтой кодыг таах оролдлогыг хязгаарлана (захиалга тус бүрт 15 мин-д 6 удаа), харьцуулалт тогтмол хугацаатай.
+    const otpResult = checkOtp(`deliver:${orderId}`, order.deliveryOtp, otp);
+    if (otpResult === "locked") throw new DeliveryAssignmentError(OTP_LOCKED_MESSAGE);
+    if (otpResult !== "ok") {
       throw new DeliveryAssignmentError(
         order.orderType === OrderType.COURIER_ERRAND
           ? "Код буруу байна — илгээгч курьерээс хүргэлтийн кодыг дахин асууна уу"
@@ -370,12 +377,16 @@ export async function confirmDeliveryStep(orderId: string, courierId: string, ot
     }
 
     const nextStatus = hasRental ? DeliveryAssignStatus.GIVEN : DeliveryAssignStatus.DELIVERED;
-    const updated = await prisma.order.update({
-      where: { id: orderId },
+    // ✅ ЗАСВАР (race): PICKED_UP → GIVEN/DELIVERED шилжилтийг атом claim-ээр хийнэ — давхар дарахад SALE барааны "олгосон" тэмдэг,
+    // мэдэгдэл, курьерийн олголтын мэдэгдэл 2 удаа ажиллахгүй.
+    const claim = await prisma.order.updateMany({
+      where: { id: orderId, courierId, deliveryAssignStatus: DeliveryAssignStatus.PICKED_UP },
       data: hasRental
         ? { deliveryAssignStatus: nextStatus, rentalGivenAt: new Date() }
         : { deliveryAssignStatus: nextStatus, deliveredAt: new Date() },
     });
+    if (claim.count === 0) throw new DeliveryAssignmentError("Захиалгын төлөв өөрчлөгдсөн байна — дахин шалгана уу");
+    const updated = await prisma.order.findUniqueOrThrow({ where: { id: orderId } });
 
     if (!hasRental) {
       // ✅ ЗАСВАР: Захиалга ЭНЭ Л АЛХАМД (түрээс биш) эцэслэн "Хүргэгдсэн"
@@ -429,14 +440,18 @@ export async function confirmDeliveryStep(orderId: string, courierId: string, ot
     // ---- 2-р алхам (ЗӨВХӨН ТҮРЭЭСТ): Курьер харилцагчаас буцаан авсан
     // (returnOtp-оор шалгана) — гэхдээ энэ бол ЗАМД байгаа гэсэн үг,
     // ДЭЛГҮҮРТ хараахан ирээгүй тул ЭЦСИЙН биш (RETURN_PICKED_UP).
-    if (!order.returnOtp || otp !== order.returnOtp) {
+    const otpResult = checkOtp(`return:${orderId}`, order.returnOtp, otp);
+    if (otpResult === "locked") throw new DeliveryAssignmentError(OTP_LOCKED_MESSAGE);
+    if (otpResult !== "ok") {
       throw new DeliveryAssignmentError("Код буруу байна — харилцагчаас дахин асууна уу");
     }
 
-    const updated = await prisma.order.update({
-      where: { id: orderId },
+    const claim = await prisma.order.updateMany({
+      where: { id: orderId, courierId, deliveryAssignStatus: DeliveryAssignStatus.GIVEN },
       data: { deliveryAssignStatus: DeliveryAssignStatus.RETURN_PICKED_UP, returnPickedUpAt: new Date() },
     });
+    if (claim.count === 0) throw new DeliveryAssignmentError("Захиалгын төлөв өөрчлөгдсөн байна — дахин шалгана уу");
+    const updated = await prisma.order.findUniqueOrThrow({ where: { id: orderId } });
 
     emitToStore(updated.storeId, "delivery_return_picked_up", { orderId, courierId });
     return updated;
@@ -456,6 +471,8 @@ export async function confirmDeliveryStep(orderId: string, courierId: string, ot
  * тохиолдолд ихэвчлэн 1 мөр байдаг).
  */
 export async function confirmReturnedToShop(orderId: string, damageFee: number, damageNote?: string) {
+  // ✅ ЗАСВАР: сөрөг/тоо биш гэмтлийн торгууль барьцаанаас ИЛҮҮ мөнгө буцаахад хүргэнэ — эхэнд нь татгалзана.
+  if (!Number.isFinite(damageFee) || damageFee < 0) throw new DeliveryAssignmentError("Гэмтлийн торгууль буруу байна (0 эсвэл түүнээс их тоо)");
   const order = await prisma.order.findUnique({ where: { id: orderId }, include: { items: { include: { rentalDetail: true } } } });
   if (!order) throw new DeliveryAssignmentError("Захиалга олдсонгүй");
   if (order.deliveryAssignStatus !== DeliveryAssignStatus.RETURN_PICKED_UP) {
@@ -473,10 +490,12 @@ export async function confirmReturnedToShop(orderId: string, damageFee: number, 
     }
   }
 
-  const updated = await prisma.order.update({
-    where: { id: orderId },
+  const claim = await prisma.order.updateMany({
+    where: { id: orderId, deliveryAssignStatus: DeliveryAssignStatus.RETURN_PICKED_UP },
     data: { deliveryAssignStatus: DeliveryAssignStatus.DELIVERED, deliveredAt: now },
   });
+  if (claim.count === 0) throw new DeliveryAssignmentError("Захиалгын төлөв өөрчлөгдсөн байна — буцаалт аль хэдийн баталгаажсан байж болзошгүй");
+  const updated = await prisma.order.findUniqueOrThrow({ where: { id: orderId } });
 
   emitToStore(updated.storeId, "delivery_completed", { orderId });
   if (updated.courierId) {
