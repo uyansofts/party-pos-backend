@@ -683,7 +683,7 @@ model OrderItem {
   // ONLINE захиалгад хэрэглэгч ирж авах хүртэл false үлдэнэ.
   isIssued Boolean   @default(false)
   issuedAt DateTime?
-
+  refundedAt DateTime?
   rentalDetail RentalDetail? // itemType == RENTAL үед л энэ мөр үүснэ
 
   // ✅ ШИНЭ: Тусгай захиалгын мэдээлэл — сонгосон Variation утгууд (Material/
